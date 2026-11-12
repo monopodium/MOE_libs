@@ -1,0 +1,4 @@
+{"T": 4096, "F": 2.0, "routing": "extreme", "ctx_bytes": 1610622976, "max_recv_rows": 42488, "mean_recv_rows": 24576, "capacity_rows": 49152, "us": 6778.080078125, "checksum": 217621.0625}
+{"T": 4096, "F": 8.0, "routing": "extreme", "ctx_bytes": 6442461184, "max_recv_rows": 42488, "mean_recv_rows": 24576, "capacity_rows": 196608, "us": 6810.23974609375, "checksum": 217621.0625}
+{"T": 4096, "F": 2.0, "routing": "extreme", "ctx_bytes": 1610622976, "max_recv_rows": 42488, "mean_recv_rows": 24576, "capacity_rows": 49152, "us": 6671.744140625, "checksum": 217621.0625}
+{"T": 4096, "F": 8.0, "routing": "extreme", "ctx_bytes": 6442461184, "max_recv_rows": 42488, "mean_recv_rows": 24576, "capacity_rows": 196608, "us": 6767.1201171875, "checksum": 217621.0625}

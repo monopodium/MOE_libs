@@ -1,0 +1,12 @@
+[submodule "DeepEP"]
+	path = DeepEP
+	url = https://github.com/deepseek-ai/DeepEP.git
+[submodule "DeepGEMM"]
+	path = DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+[submodule "Mooncake"]
+	path = Mooncake
+	url = https://github.com/kvcache-ai/Mooncake.git
+[submodule "dist_moe"]
+	path = dist_moe
+	url = https://github.com/meta-pytorch/dist_moe.git

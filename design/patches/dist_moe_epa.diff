@@ -1,0 +1,312 @@
+--- a/dist_moe/api.py
++++ b/dist_moe/api.py
+@@ -13,11 +13,13 @@
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import dataclasses
+ import gc
+ import itertools
+ import logging
+ import math
++import os
+ import threading
+ from typing import Any, get_args, Literal, TYPE_CHECKING
+ 
+@@ -808,6 +810,42 @@
+     return resolved
+ 
+ 
++def _epa_chunk_model_config(config: Config, ep_size: int, num_local_input_tokens: int | None = None):
++    """Return the EPArena window-sized model config, or ``None`` when disabled.
++
++    EPArena (Home + Window, ``epa/window.cuh``; Python mirror ``_epa_window``)
++    keeps ``device_scratch_capacity_factor`` as the routing guarantee but backs
++    it with a window of only ``DIST_MOE_EPA_CHUNK`` x balanced rows. The source
++    ranks' dispatch buffers are the Home; the BF16 inference forward is a
++    per-launch consumer that runs W13/SwiGLU/W2 once per round of the window,
++    so any load up to the capacity factor fits in ``Window.num_rounds()``
++    launches; rounds past the received rows are gated off on device.
++    """
++    chunk = os.environ.get("DIST_MOE_EPA_CHUNK")
++    if chunk is None or not config.inference or config.block_scaled is not None or config.vmm is not None:
++        return None
++    factor = min(float(chunk), config.device_scratch_capacity_factor, float(ep_size))
++    model_config = _model_config(config, ep_size=ep_size, num_local_input_tokens=num_local_input_tokens)
++    return dataclasses.replace(model_config, max_imbalance_factor=factor)
++
++
++def _epa_arena_pages() -> int:
++    """Pages of the EPArena arena backing the scratch windows (0: static window).
++
++    With ``DIST_MOE_EPA_ARENA_PAGES=N`` the activation buffer holds an ``epa::Arena`` of
++    N window-sized pages (the grouped GEMMs need one contiguous scratch per round).
++    Each round takes a page on device before its first GEMM and gives it back after
++    the combine GEMM; a round without rows takes nothing.
++    """
++    return int(os.environ.get("DIST_MOE_EPA_ARENA_PAGES", "0"))
++
++
++def _epa_arena_layout(window_bytes: int, num_pages: int) -> tuple[int, int]:
++    """Return (page_bytes, meta_start): pages at the buffer start, ring state after."""
++    page_bytes = -(-window_bytes // 4096) * 4096
++    return page_bytes, num_pages * page_bytes
++
++
+ def _model_config(
+     config: Config,
+     *,
+@@ -952,6 +990,14 @@
+     num_slots = 0 if config.inference else config.num_activation_slots
+     if config.inference:
+         device_scratch = _align_memory(model_config.min_buffer_size(0))
++        epa_chunk_config = _epa_chunk_model_config(effective_config, ep_size)
++        if epa_chunk_config is not None:
++            device_scratch = _align_memory(epa_chunk_config.min_buffer_size(0))
++            if _epa_arena_pages() > 0:
++                from ._epa_arena_torch import meta_bytes
++
++                page_bytes, meta_start = _epa_arena_layout(device_scratch, _epa_arena_pages())
++                device_scratch = _align_memory(meta_start + meta_bytes(_epa_arena_pages()))
+         minimum_slot_bytes = 0
+         balanced_full_save_slot_bytes = 0
+     else:
+@@ -2052,9 +2098,23 @@
+             ep_size=dist.get_world_size(context.group),
+             num_local_input_tokens=num_local_input_tokens,
+         )
++        ep_size = dist.get_world_size(context.group)
++        epa_chunk_config = (
++            None
++            if save_for_backward
++            else _epa_chunk_model_config(
++                dataclasses.replace(
++                    config,
++                    device_scratch_capacity_factor=min(
++                        config.device_scratch_capacity_factor, float(ep_size)
++                    ),
++                ),
++                ep_size,
++            )
++        )
+         validate_buffer_capacity(
+             buffer_size=activation_buffer.buffer.numel(),
+-            model_config=model_config,
++            model_config=model_config if epa_chunk_config is None else epa_chunk_config,
+             num_activation_slots=(
+                 0 if config.inference else activation_buffer.num_activation_slots
+             ),
+@@ -2062,8 +2122,44 @@
+         num_recv_rows_per_rank_R = (
+             torch.empty_like(routing.num_tokens_per_rank) if save_for_backward else None
+         )
++        if epa_chunk_config is not None:
++            # EPArena window over the expert-major receive list: the plan places
++            # x_gathered/h1/h2 for one window; rounds cover the capacity factor.
++            from ._epa_window import Window as _EpaWindow
++            from ._epa_window import round_if_nonempty as _epa_round_if_nonempty
++
++            epa_window = _EpaWindow(
++                shared=epa_chunk_config.max_recv_tokens,
++                max_rows=model_config.max_recv_tokens,
++            )
++            epa_chunk_rows = epa_window.shared
++            epa_num_chunks = epa_window.num_rounds()
++            epa_counts_CE, epa_rows_C, epa_run_C = epa_window.round_counts(
++                routing.num_tokens_per_local_experts
++            )
++            epa_num_pages = _epa_arena_pages()
++            if epa_num_pages > 0:
++                from ._epa_arena_torch import ext as _epa_arena_ext
++
++                epa_arena = _epa_arena_ext()
++                epa_page_bytes, epa_meta_start = _epa_arena_layout(
++                    _align_memory(epa_chunk_config.min_buffer_size(0)), epa_num_pages
++                )
++                epa_arena_args = (
++                    activation_buffer.buffer, epa_meta_start, 0, epa_num_pages, epa_page_bytes
++                )
++                if _EPA_ARENA_READY.get(activation_buffer.buffer.data_ptr()) != epa_arena_args[1:]:
++                    epa_arena.init(*epa_arena_args)   # every page free (first call, eager)
++                    _EPA_ARENA_READY[activation_buffer.buffer.data_ptr()] = epa_arena_args[1:]
++                epa_round_off_C3 = torch.empty(
++                    epa_num_chunks, 3, dtype=torch.int64, device=epa_rows_C.device
++                )
++                epa_round_page_C = torch.empty(
++                    epa_num_chunks, dtype=torch.int32, device=epa_rows_C.device
++                )
++            num_plan_rows_1 = torch.full_like(num_recv_rows_1, epa_chunk_rows)
+         forward_plan = get_forward_plan(
+-            num_recv_tokens=num_recv_rows_1,
++            num_recv_tokens=num_recv_rows_1 if epa_chunk_config is None else num_plan_rows_1,
+             num_recv_tokens_per_rank=routing.num_tokens_per_rank,
+             buffer_status=activation_buffer,
+             model_config=model_config,
+@@ -2107,56 +2203,106 @@
+             # The outer operation owns input publication and peer barriers.
+             # Actual row counts stay on-device; this estimate only selects a
+             # launch configuration and never truncates the routed rows.
+-            dist_grouped_gemm_fprop_dispatch(
+-                x=x_TD,
+-                w=w13_EFD,
+-                num_tokens_per_local_expert=routing.num_tokens_per_local_experts,
+-                gather_ptrs=routing.fwd_gather_ptrs,
+-                num_out_tokens=None,
+-                symm_mem_buffer=buffers.dispatch,
+-                topk=context.top_k,
+-                num_sms=config.num_sms,
+-                activation_buffer=activation_buffer.buffer,
+-                y=forward_plan.h1_offset,
+-                x_gathered=forward_plan.x_gathered_offset,
+-                config=fprop_config,
+-                estimate_recv_num_tokens=estimated_num_recv_rows,
+-                swiglu_h2=forward_plan.h2_offset if fused_swiglu_forward else None,
+-                swiglu_clamped=config.activation == "swiglu_clamped",
+-                swiglu_alpha=config.swiglu_alpha,
+-                swiglu_limit=config.swiglu_limit,
+-            )
+-            # Clip observation and unsupported explicit presets retain the
+-            # standalone activation; the native epilogue does not implement
+-            # SiTU-GLU. Eligible dispatch emits both H1 and H2.
+-            if not fused_swiglu_forward:
+-                swiglu_fwd(
+-                    x=forward_plan.h1_offset,
+-                    z=forward_plan.h2_offset,
+-                    clamped=config.activation == "swiglu_clamped",
+-                    alpha=config.swiglu_alpha,
+-                    limit=config.swiglu_limit,
+-                    situ_glu=config.activation == "situ_glu",
+-                    situ_glu_gate_beta=config.situ_glu_gate_beta,
+-                    situ_glu_up_beta=config.situ_glu_up_beta,
+-                    activation_buffer=activation_buffer.buffer,
+-                    num_recv_tokens=num_recv_rows_1,
+-                    feature_dim=w2_EDF.shape[2],
+-                    dtype=w2_EDF.dtype,
+-                    clip_stats_out=options.swiglu_clip_stats_out_3,
+-                    clip_limit=options.swiglu_clip_limit,
+-                )
+-            h3_MD = dist_grouped_gemm_fprop_combine(
+-                x=forward_plan.h2_offset,
+-                w=w2_EDF,
+-                num_tokens_per_local_expert=routing.num_tokens_per_local_experts,
+-                scatter_ptrs=routing.scatter_ptrs,
+-                symm_mem_buffer=buffers.combine,
+-                num_sms=config.num_sms,
+-                activation_buffer=activation_buffer.buffer,
+-                config=combine_config,
+-                estimate_recv_num_tokens=estimated_num_recv_rows,
+-            )
++            if epa_chunk_config is None:
++                windows = [(
++                    routing.num_tokens_per_local_experts,
++                    routing.fwd_gather_ptrs,
++                    routing.scatter_ptrs,
++                    num_recv_rows_1,
++                    None,
++                )]
++                epa_num_pages = 0
++            else:
++                windows = [
++                    (
++                        epa_counts_CE[c],
++                        routing.fwd_gather_ptrs[c * epa_chunk_rows : (c + 1) * epa_chunk_rows],
++                        routing.scatter_ptrs[c * epa_chunk_rows : (c + 1) * epa_chunk_rows],
++                        epa_rows_C[c : c + 1],
++                        # windows past the received rows exit after kernel setup
++                        None if c == 0 else epa_run_C[c : c + 1],
++                    )
++                    for c in range(epa_num_chunks)
++                ]
++            epa_round_seen: list[int] = []
++            for window_counts_E, window_gather_ptrs, window_scatter_ptrs, window_rows_1, window_run_1 in windows:
++                # rounds past the first: a CUDA-graph IF node when capturing, else an
++                # in-kernel gate (window_run_1)
++                with (
++                    contextlib.nullcontext(False)
++                    if window_run_1 is None
++                    else _epa_round_if_nonempty(window_rows_1)
++                ) as graph_gated:
++                    r_xg, r_h1, r_h2 = (
++                        forward_plan.x_gathered_offset,
++                        forward_plan.h1_offset,
++                        forward_plan.h2_offset,
++                    )
++                    if epa_num_pages > 0:
++                        # this round's scratch: a page taken from the arena on device
++                        c = len(epa_round_seen)
++                        epa_round_seen.append(c)
++                        epa_arena.round_take(
++                            *epa_arena_args, window_rows_1, r_xg, r_h1, r_h2,
++                            epa_round_off_C3[c], epa_round_page_C[c : c + 1],
++                        )
++                        r_xg = epa_round_off_C3[c, 0:1]
++                        r_h1 = epa_round_off_C3[c, 1:2]
++                        r_h2 = epa_round_off_C3[c, 2:3]
++                    dist_grouped_gemm_fprop_dispatch(
++                        x=x_TD,
++                        w=w13_EFD,
++                        num_tokens_per_local_expert=window_counts_E,
++                        gather_ptrs=window_gather_ptrs,
++                        num_out_tokens=None,
++                        symm_mem_buffer=buffers.dispatch,
++                        topk=context.top_k,
++                        num_sms=config.num_sms,
++                        activation_buffer=activation_buffer.buffer,
++                        y=r_h1,
++                        x_gathered=r_xg,
++                        config=fprop_config,
++                        estimate_recv_num_tokens=estimated_num_recv_rows,
++                        conditional_execution=None if graph_gated else window_run_1,
++                        swiglu_h2=r_h2 if fused_swiglu_forward else None,
++                        swiglu_clamped=config.activation == "swiglu_clamped",
++                        swiglu_alpha=config.swiglu_alpha,
++                        swiglu_limit=config.swiglu_limit,
++                    )
++                    # Clip observation and unsupported explicit presets retain the
++                    # standalone activation; the native epilogue does not implement
++                    # SiTU-GLU. Eligible dispatch emits both H1 and H2.
++                    if not fused_swiglu_forward:
++                        swiglu_fwd(
++                            x=r_h1,
++                            z=r_h2,
++                            clamped=config.activation == "swiglu_clamped",
++                            alpha=config.swiglu_alpha,
++                            limit=config.swiglu_limit,
++                            situ_glu=config.activation == "situ_glu",
++                            situ_glu_gate_beta=config.situ_glu_gate_beta,
++                            situ_glu_up_beta=config.situ_glu_up_beta,
++                            activation_buffer=activation_buffer.buffer,
++                            num_recv_tokens=window_rows_1,
++                            feature_dim=w2_EDF.shape[2],
++                            dtype=w2_EDF.dtype,
++                            clip_stats_out=options.swiglu_clip_stats_out_3,
++                            clip_limit=options.swiglu_clip_limit,
++                        )
++                    h3_MD = dist_grouped_gemm_fprop_combine(
++                        x=r_h2,
++                        w=w2_EDF,
++                        num_tokens_per_local_expert=window_counts_E,
++                        scatter_ptrs=window_scatter_ptrs,
++                        symm_mem_buffer=buffers.combine,
++                        num_sms=config.num_sms,
++                        activation_buffer=activation_buffer.buffer,
++                        config=combine_config,
++                        estimate_recv_num_tokens=estimated_num_recv_rows,
++                        conditional_execution=None if graph_gated else window_run_1,
++                    )
++                    if epa_num_pages > 0:
++                        epa_arena.round_give(*epa_arena_args, epa_round_page_C[c : c + 1])
+             h3_MD = h3_MD.view(-1, context.hidden_dim)[
+                 : num_local_input_tokens * context.top_k
+             ]
+@@ -2658,6 +2804,9 @@
+ 
+ # Keep context-owned mutable storage explicit so tracing and CUDA graphs retain
+ # the operation's ordering and lifetime dependencies.
++# activation buffers whose EPArena arena is initialized: data_ptr -> layout
++_EPA_ARENA_READY: dict[int, tuple] = {}
++
+ _LIBRARY = torch.library.Library("dist_moe", "DEF")
+ _LIBRARY.define(
+     "bf16(Tensor x_TD, Tensor topk_expert_ids_TK, Tensor topk_scores_TK, Tensor w13_EFD, Tensor w2_EDF, "

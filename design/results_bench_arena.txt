@@ -1,0 +1,28 @@
+1. malloc/free, 151552 threads x 64 rounds, 4 live objects per thread
+      16 B   CUDA malloc      3.3 M/s   epa::WarpHeap  11023.2 M/s   (3313x)   pages back: all
+      64 B   CUDA malloc      3.3 M/s   epa::WarpHeap  10639.3 M/s   (3180x)   pages back: all
+     256 B   CUDA malloc      1.7 M/s   epa::WarpHeap   8887.9 M/s   (5311x)   pages back: all
+    1024 B   CUDA malloc      0.2 M/s   epa::WarpHeap   5758.4 M/s   (35531x)   pages back: all
+   failed allocations: 0
+2. page take + give, one warp-aggregated take per warp per round
+   local, 1 page(s) per lane:     5089.7 M pages/s   (failed warp takes so far: 0)
+   GPU 1 -> GPU 0's arena (NVLink), 1 page(s):   2067.8 M pages/s
+   local, 4 page(s) per lane:     7824.7 M pages/s   (failed warp takes so far: 0)
+   GPU 1 -> GPU 0's arena (NVLink), 4 page(s):   3531.9 M pages/s
+3. variable-size output (64 B records, skewed counts per thread)
+    1048576 threads, work 0, 5592615 records (341.3 MiB):
+      worst case [T][128]      8192.0 MiB    0.199 ms
+      count + scan + write     341.3 MiB    0.212 ms
+      PagedArray append        341.4 MiB    0.316 ms  (pages in use; release included)
+    8388608 threads, work 0, 44827446 records (2736.1 MiB):
+      worst case [T][128]     65536.0 MiB    1.389 ms
+      count + scan + write    2736.1 MiB    1.378 ms
+      PagedArray append       2736.1 MiB    1.980 ms  (pages in use; release included)
+    1048576 threads, work 256, 5612079 records (342.5 MiB):
+      worst case [T][128]      8192.0 MiB    0.202 ms
+      count + scan + write     342.5 MiB    0.305 ms
+      PagedArray append        342.6 MiB    0.338 ms  (pages in use; release included)
+    8388608 threads, work 256, 44847574 records (2737.3 MiB):
+      worst case [T][128]     65536.0 MiB    1.386 ms
+      count + scan + write    2737.3 MiB    2.134 ms
+      PagedArray append       2737.3 MiB    2.244 ms  (pages in use; release included)

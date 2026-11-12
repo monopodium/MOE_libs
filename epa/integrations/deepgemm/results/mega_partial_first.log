@@ -1,0 +1,3 @@
+{"T": 1024, "skew": 0.0, "load": null, "rep": 0, "hang": false, "passed": true, "buffer_bytes": 499804544, "ring_rows": 19200, "us_median": 411.5, "us_max": 412.0, "n_ranks": 8}
+{"T": 1024, "skew": 0.0, "load": 2.0, "rep": 0, "hang": false, "passed": true, "buffer_bytes": 322811264, "ring_rows": 7680, "us_median": 411.0, "us_max": 412.0, "n_ranks": 8}
+{"T": 1024, "skew": 0.0, "load": 1.25, "rep": 0, "hang": false, "passed": true, "buffer_bytes": 322811264, "ring_rows": 7680, "us_median": 411.0, "us_max": 412.0, "n_ranks": 8}

@@ -1,0 +1,46 @@
+diff --git a/csrc/apis/mega_moe.hpp b/csrc/apis/mega_moe.hpp
+index 81d682b..ed58596 100644
+--- a/csrc/apis/mega_moe.hpp
++++ b/csrc/apis/mega_moe.hpp
+@@ -1,11 +1,13 @@
+ #pragma once
+ 
+ #include <functional>
++#include <cstdlib>
+ #include <string>
+ #include <pybind11/functional.h>
+ 
+ #include <deep_gemm/common/types.cuh>
+ #include <deep_gemm/scheduler/mega_moe.cuh>
++#include <epa/window.cuh>
+ 
+ #include "../runtime/runtime.hpp"
+ #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
+@@ -62,6 +64,27 @@ get_symm_buffer_size_for_mega_moe(
+     }
+     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
+ 
++    // EPArena: size the ring for the load a rank actually receives instead of all
++    // R*T*k routed tokens. The kernel flow-controls ring slots (empty counters), so a
++    // smaller ring stays correct as long as it holds the schedule's live blocks for the
++    // real block count; DG_EPA_RING_LOAD = that receiver load as a multiple of T*k.
++    if (const char* load = std::getenv("DG_EPA_RING_LOAD")) {
++        // EPArena window (epa/window.cuh) with a per-block consumer: the ring's slots are
++        // freed by its empty counters, so it only has to hold the live blocks of a
++        // window of beta x T*k routed rows; heavier routing just waits on slots.
++        const auto num_routed = static_cast<int>(epa::window_rows(std::atof(load), num_max_tokens_per_rank, num_active_topk));
++        int num_epa_ring_tokens = 0;
++        for (const auto& block_m: layout::kCandidateBlockM) {
++            const auto num_pool_blocks = ceil_div(num_routed, block_m) + num_experts_per_rank;
++            num_epa_ring_tokens = std::max(num_epa_ring_tokens,
++                sched::get_num_max_live_pool_blocks(num_pool_blocks, num_sms, hidden, intermediate_hidden) * block_m);
++        }
++        epa::Window ring;
++        ring.max_rows = num_ring_tokens;   // upstream: the live blocks of R*T*k routed rows
++        ring.shared = std::min<int64_t>(ring.max_rows, math::align(num_epa_ring_tokens, layout::kLCMCandidateBlockM));
++        num_ring_tokens = static_cast<int>(ring.shared);
++    }
++
+     // Parse MMA type
+     const auto mma_kind = parse_mma_kind(mma_type);
+     const auto with_sf = is_mma_with_sf(mma_kind);

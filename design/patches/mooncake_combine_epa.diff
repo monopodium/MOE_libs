@@ -1,0 +1,56 @@
+--- Mooncake/mooncake-ep/include/mooncake_ep_combine.cuh	2026-10-29 16:43:39.964986848 -0700
++++ epa/integrations/mooncake/epa_combine.cuh	2026-10-30 13:57:26.125290293 -0700
+@@ -9,7 +9,11 @@
+ #include <mooncake_ep_utils.cuh>
+ #include <transport/device/comm_device.cuh>
+ 
+-namespace mooncake {
++#include <epa/window.cuh>
++
++namespace mooncake_epa {
++
++using namespace mooncake;
+ 
+ using mooncake::device::CommCtx;
+ using mooncake::device::make_comm_ctx;
+@@ -133,7 +137,7 @@
+     // Clean up next buffer
+     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+ #pragma unroll
+-        for (int i = lane_id; i < qp_num_ranks * num_local_experts; i += 32)
++        for (int i = lane_id; i < qp_num_ranks * num_local_experts + 1; i += 32)  // EPA: + pool head
+             next_clean_buffer[i] = 0;
+ 
+         // Notify before executing `int_p`
+@@ -185,12 +189,15 @@
+ 
+             // Copy directly to local rank, or copy to buffer and issue RDMA
+             auto src_idx = __ldg(local_src_info + token_idx);
++            // EPA: results are keyed by top-k position, not by expert
++            const int epa_k = src_idx >> 24;
++            src_idx &= 0xffffff;
+             const auto buf_ptr = reinterpret_cast<void*>(rdma_send_x_vec_row);
+             const auto* send_x_int4 =
+                 zero_copy ? reinterpret_cast<const int4*>(buf_ptr) : x_int4;
+             const auto dst_ptr = reinterpret_cast<void*>(
+                 reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
+-                (global_expert_idx * num_max_dispatch_tokens_per_rank +
++                (static_cast<int64_t>(epa_k) * num_max_dispatch_tokens_per_rank +
+                  src_idx) *
+                     num_bytes_per_slot);
+ 
+@@ -403,7 +410,7 @@
+                     // Read from sources
+                     auto rdma_buffer_type = reinterpret_cast<const int*>(
+                         reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
+-                        (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank +
++                        (static_cast<int64_t>(i) * num_max_dispatch_tokens_per_rank +
+                          token_idx) *
+                             num_bytes_per_slot);
+                     auto rdma_buffer_row =
+@@ -463,4 +470,4 @@
+                         kNumMaxTopk>(args);
+ }
+ 
+-}  // namespace mooncake
++}  // namespace mooncake_epa

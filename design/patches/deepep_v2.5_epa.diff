@@ -1,0 +1,733 @@
+diff --git a/csrc/buffers/ep.hpp b/csrc/buffers/ep.hpp
+index 04f4dbf..26423ca 100644
+--- a/csrc/buffers/ep.hpp
++++ b/csrc/buffers/ep.hpp
+@@ -7,6 +7,7 @@
+ #include <pybind11/functional.h>
+ 
+ #include <deep_ep/common/compiled.cuh>
++#include <deep_ep/layout/ep/epa.cuh>
+ #include <deep_ep/layout/ep/token.cuh>
+ #include <deep_ep/layout/ep/workspace.cuh>
+ #include <deep_ep/layout/ep/eplb.cuh>
+@@ -25,6 +26,9 @@ class EPBuffer: public BufferBase {
+     // Memory layout: [Workspace, buffer]
+     int64_t num_buffer_bytes;
+ 
++    // EPArena: device table of every NVLink peer's EP buffer base (for tier-3 pulls)
++    mutable void** epa_peer_buffers = nullptr;
++
+     // Host workspace
+     void *host_workspace, *mapped_host_workspace;
+ 
+@@ -180,6 +184,21 @@ public:
+         return event;
+     }
+ 
++    // EPArena on the direct NVLink dispatch path (see `layout/ep/epa.cuh`):
++    //   EP_EPA_CAP   tier-1 slots per source rank (unset: upstream layout)
++    //   EP_EPA_POOL  tier-2 pool rows shared by all source ranks
++    // or the full epa::Arena (returned as cap = -(P + 1), pool = pages):
++    //   EP_EPA_ARENA_P      tokens per page
++    //   EP_EPA_ARENA_PAGES  pages in each rank's arena
++    static std::pair<int, int> get_epa_config(const int& num_scaleout_ranks, const bool& is_scaleup_nvlink) {
++        if (const int P = get_env<int>("EP_EPA_ARENA_P", 0); P > 0 and num_scaleout_ranks == 1 and is_scaleup_nvlink)
++            return {-(P + 1), get_env<int>("EP_EPA_ARENA_PAGES", 0)};
++        const int cap = get_env<int>("EP_EPA_CAP", -1);
++        if (cap < 0 or num_scaleout_ranks != 1 or not is_scaleup_nvlink)
++            return {-1, 0};
++        return {cap, get_env<int>("EP_EPA_POOL", 0)};
++    }
++
+     static int64_t get_dispatch_buffer_size(const int& num_max_tokens_per_rank,
+                                             const int& hidden, const int& num_sf_packs, const int& num_topk,
+                                             const int& elem_size,
+@@ -188,6 +207,11 @@ public:
+         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
+         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
+ 
++        if (const auto [epa_cap, epa_pool] = get_epa_config(num_scaleout_ranks, is_scaleup_nvlink); epa_cap != -1) {
++            // Direct dispatch with EPArena: window (or arena pages), home rows, descriptors
++            return layout::EPALayout(token_layout.get_num_bytes<false, int64_t>(), num_ranks, num_max_tokens_per_rank,
++                                     epa_cap, epa_pool, 0).num_data_bytes();
++        }
+         if (num_scaleout_ranks == 1) {
+             // Direct dispatch
+             const auto send_buffer_layout = layout::BufferLayout<false>(
+@@ -278,8 +302,12 @@ public:
+             num_scaleout_ranks, num_scaleup_ranks,
+             is_scaleup_nvlink, allow_multiple_reduction);
+ 
+-        // Return the maximum of those layouts, aligned to 2 MB
+-        return math::align<int64_t>(std::max(num_dispatch_bytes, num_combine_bytes), kNumAllocationAlignmentBytes);
++        // Return the maximum of those layouts (plus EPArena's tables at the tail), aligned to 2 MB
++        const auto [epa_cap_, epa_pool_] = get_epa_config(num_scaleout_ranks, is_scaleup_nvlink);
++        const auto num_epa_table_bytes = epa_cap_ != -1 ?
++            layout::EPALayout::num_table_bytes(num_scaleout_ranks * num_scaleup_ranks, epa_cap_, epa_pool_, num_max_tokens_per_rank) : 0;
++        return math::align<int64_t>(std::max(num_dispatch_bytes, num_combine_bytes) + num_epa_table_bytes,
++                                    kNumAllocationAlignmentBytes);
+     }
+ 
+     pybind11::tuple
+@@ -540,11 +568,35 @@ public:
+             channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
+         }
+ 
++        // EPArena: tables live at the tail of the buffer, zeroed once; peers' buffer bases for pulls
++        const auto [epa_cap, epa_pool] = get_epa_config(context->num_scaleout_ranks, context->is_scaleup_nvlink);
++        const int64_t epa_tables = epa_cap != -1 ?
++            num_buffer_bytes - layout::EPALayout::num_table_bytes(context->num_ranks, epa_cap, epa_pool, num_max_tokens_per_rank) : 0;
++        if (epa_cap != -1 and epa_peer_buffers == nullptr) {
++            std::vector<void*> peers(context->num_nvl_ranks);
++            for (int r = 0; r < context->num_nvl_ranks; ++ r)
++                peers[r] = context->get_sym_ptr(context->buffer, r);
++            CUDA_RUNTIME_CHECK(cudaMalloc(&epa_peer_buffers, sizeof(void*) * peers.size()));
++            CUDA_RUNTIME_CHECK(cudaMemcpy(epa_peer_buffers, peers.data(), sizeof(void*) * peers.size(), cudaMemcpyHostToDevice));
++            CUDA_RUNTIME_CHECK(cudaMemsetAsync(math::advance_ptr(context->buffer, epa_tables), 0,
++                layout::EPALayout::num_table_bytes(context->num_ranks, epa_cap, epa_pool, num_max_tokens_per_rank), comm_stream));
++            if (epa_cap < -1) {
++                // epa::Arena: every page free; page tables empty
++                const auto epa = layout::EPALayout(
++                    get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk).get_num_bytes<false, int64_t>(),
++                    context->num_ranks, num_max_tokens_per_rank, epa_cap, epa_pool, epa_tables);
++                const auto img = epa::Arena::host_init_image(epa.num_pages);
++                CUDA_RUNTIME_CHECK(cudaStreamSynchronize(comm_stream));
++                CUDA_RUNTIME_CHECK(cudaMemcpy(math::advance_ptr(context->buffer, epa.arena_offset()), img.data(), img.size(),
++                                              cudaMemcpyHostToDevice));
++            }
++        }
++
+         // Check buffer size
+         EP_HOST_ASSERT(get_dispatch_buffer_size(
+                        num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
+                        context->num_scaleout_ranks, context->num_scaleup_ranks,
+-                       context->is_scaleup_nvlink) <= num_buffer_bytes);
++                       context->is_scaleup_nvlink) <= (epa_cap != -1 ? epa_tables : num_buffer_bytes));
+ 
+         // Ready and clean host workspace for this round
+         const auto host_workspace_layout = layout::EPWorkspaceLayout(
+@@ -579,7 +631,8 @@ public:
+                         num_smem_bytes,
+                         num_qps, context->num_gpu_timeout_cycles,
+                         cached_mode, do_cpu_sync,
+-                        comm_stream);
++                        comm_stream,
++                        epa_cap, epa_pool, epa_tables);
+ 
+         // For tensor recording
+         tensor_list_t tensors_to_record = {
+@@ -740,7 +793,8 @@ public:
+                                           num_channels,
+                                           do_expand, cached_mode,
+                                           do_zero_padding,
+-                                          stream);
++                                          stream,
++                                          epa_cap, epa_pool, epa_tables, epa_peer_buffers);
+ 
+             auto result = pybind11::make_tuple(
+                 recv_x, recv_sf,
+diff --git a/csrc/kernels/ep/dispatch.hpp b/csrc/kernels/ep/dispatch.hpp
+index 953af9f..12bbb85 100644
+--- a/csrc/kernels/ep/dispatch.hpp
++++ b/csrc/kernels/ep/dispatch.hpp
+@@ -51,7 +51,8 @@ static void launch_dispatch(void* x, void* sf,
+                             const int& num_qps, const int64_t& num_timeout_cycles,
+                             const bool& cached_mode,
+                             const bool& do_cpu_sync,
+-                            const at::cuda::CUDAStream& stream) {
++                            const at::cuda::CUDAStream& stream,
++                            const int& epa_cap = -1, const int& epa_pool = 0, const int64_t& epa_tables = 0) {
+     // Cached mode does not support expert token counting
+     if (cached_mode)
+         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
+@@ -88,7 +89,7 @@ static void launch_dispatch(void* x, void* sf,
+     std::string header_name, func_name;
+     if (num_scaleout_ranks == 1) {
+         header_name = "dispatch";
+-        func_name = std::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
++        func_name = std::format("dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+             is_scaleup_nvlink,
+             do_cpu_sync,
+             reuse_slot_indices,
+@@ -98,8 +99,10 @@ static void launch_dispatch(void* x, void* sf,
+             hidden * elem_size, num_sf_packs,
+             num_max_tokens_per_rank,
+             num_experts, num_topk, expert_alignment,
+-            num_qps, num_timeout_cycles);
++            num_qps, num_timeout_cycles,
++            epa_cap, epa_pool, epa_tables);
+     } else {
++        EP_HOST_ASSERT(epa_cap == -1 and "EPArena needs the direct NVLink path");
+         header_name = "hybrid_dispatch";
+         func_name = std::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+             do_cpu_sync,
+@@ -183,7 +186,9 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
+                                           const int& num_channels,
+                                           const bool& do_expand, const bool& cached_mode,
+                                           const bool& do_zero_padding,
+-                                          const at::cuda::CUDAStream& stream) {
++                                          const at::cuda::CUDAStream& stream,
++                                          const int& epa_cap = -1, const int& epa_pool = 0, const int64_t& epa_tables = 0,
++                                          void* const* epa_peer_buffers = nullptr) {
+     // Maximize shared memory utilization
+     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+     const auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+@@ -194,14 +199,15 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
+ #include <deep_ep/impls/ep/dispatch_copy_epilogue.cuh>
+ 
+ static void __instantiate_kernel() {{
+-    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
++    auto ptr = reinterpret_cast<void*>(&deep_ep::ep::dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+ }}
+ )", do_expand, cached_mode, do_zero_padding,
+         num_sms, num_channels, num_warps,
+         num_scaleout_ranks, num_scaleup_ranks,
+         num_hidden_bytes, num_sf_packs,
+         num_max_tokens_per_rank,
+-        num_experts, num_topk, expert_alignment));
++        num_experts, num_topk, expert_alignment,
++        epa_cap, epa_pool, epa_tables));
+ 
+     // Launch
+     jit->launch(
+@@ -221,7 +227,8 @@ static void __instantiate_kernel() {{
+         num_unaligned_recv_tokens_per_expert,
+         num_recv_tokens,
+         recv_sf_token_stride, recv_sf_hidden_stride,
+-        scaleout_rank_idx, scaleup_rank_idx
++        scaleout_rank_idx, scaleup_rank_idx,
++        epa_peer_buffers
+     );
+ }
+ 
+diff --git a/deep_ep/include/deep_ep/impls/ep/dispatch.cuh b/deep_ep/include/deep_ep/impls/ep/dispatch.cuh
+index 3bacfc6..486e77a 100644
+--- a/deep_ep/include/deep_ep/impls/ep/dispatch.cuh
++++ b/deep_ep/include/deep_ep/impls/ep/dispatch.cuh
+@@ -8,12 +8,53 @@
+ #include <deep_ep/common/exception.cuh>
+ #include <deep_ep/common/math.cuh>
+ #include <deep_ep/common/ptx.cuh>
++#include <deep_ep/layout/ep/epa.cuh>
+ #include <deep_ep/layout/ep/token.cuh>
+ #include <deep_ep/layout/ep/workspace.cuh>
+ 
+ 
+ namespace deep_ep::ep {
+ 
++// EPA arena: take want[d] pages of destination d's arena (one reservation per
++// destination) and store their ids, from page first[d] on, in this rank's local page
++// table and in d's table of this source; got[d] = want[d], or 0 if d's arena was short.
++// Run by a team of n threads (tid) with barrier `sync`; page ids are read in parallel.
++template <typename team_t, int kNumRanks, typename gin_t, typename sync_t>
++__device__ __forceinline__ void epa_arena_take(const layout::EPALayout& epa, void* buffer, const gin_t& gin,
++                                               const int rank_idx, const int* want, const int* first, int* got,
++                                               long long* tickets, int* pfx, const int tid, const int n,
++                                               const sync_t& sync) {
++    const auto a = epa.arena(buffer);
++    for (int d = tid; d < kNumRanks; d += n) {
++        epa::Arena da = a;
++        da.base = gin.template get_sym_ptr<team_t>(a.base, d);
++        tickets[d] = want[d] > 0 ? da.try_take(want[d]) : -1;
++    }
++    sync();
++    if (tid == 0) {
++        int acc = 0;
++        for (int d = 0; d < kNumRanks; ++ d)
++            pfx[d] = acc, acc += tickets[d] >= 0 ? want[d] : 0;
++        pfx[kNumRanks] = acc;
++    }
++    sync();
++    for (int q = tid; q < pfx[kNumRanks]; q += n) {
++        int d = 0;
++        while (q >= pfx[d + 1]) ++ d;
++        epa::Arena da = a;
++        da.base = gin.template get_sym_ptr<team_t>(a.base, d);
++        const int p = first[d] + q - pfx[d];
++        const int id = da.page_at(static_cast<unsigned long long>(tickets[d]), q - pfx[d]);
++        epa.ltable(buffer)[d * epa.max_pages + p] = id;
++        *gin.template get_sym_ptr<team_t>(epa.rtable(buffer) + rank_idx * epa.max_pages + p, d) = id;
++    }
++    sync();
++    for (int d = tid; d < kNumRanks; d += n)
++        got[d] = tickets[d] >= 0 ? want[d] : 0;
++    sync();
++}
++
++
+ template <bool kIsScaleupNVLink,
+           bool kDoCPUSync,
+           bool kReuseSlotIndices,
+@@ -24,6 +65,7 @@ template <bool kIsScaleupNVLink,
+           int kNumMaxTokensPerRank,
+           int kNumExperts, int kNumTopk, int kExpertAlignment,
+           int kNumQPs, int64_t kNumTimeoutCycles,
++          int kEPACap, int kEPAPool, int64_t kEPATables,   // EPArena: tier-1 slots per source (-1: upstream layout), tier-2 pool rows
+           int kNumNotifyThreads = kNumNotifyWarps * 32,
+           int kNumDispatchThreads = kNumDispatchWarps * 32,
+           int kNumThreads = kNumNotifyThreads + kNumDispatchThreads,
+@@ -50,6 +92,19 @@ dispatch_impl(
+     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
+     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
+ 
++    // EPA arena state of SM 0 (cap < -1: arena mode, see layout/ep/epa.cuh)
++    constexpr bool kEPAArena = kEPACap < -1;
++    const auto epa_layout = layout::EPALayout(
++        layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true).get_num_bytes<false, int64_t>(),
++        kNumRanks, kNumMaxTokensPerRank, kEPACap == -1 ? 0 : kEPACap, kEPAPool, kEPATables);
++    // SM 0's take state lives in the buffer tail (see layout/ep/epa.cuh)
++    int* epa_have = kEPAArena ? epa_layout.scratch_ints(buffer) : nullptr;
++    int* epa_want = epa_have + kNumRanks;
++    int* epa_first = epa_want + kNumRanks;
++    int* epa_got = epa_first + kNumRanks;
++    int* epa_pfx = epa_got + kNumRanks;
++    long long* epa_tickets = kEPAArena ? epa_layout.scratch_tickets(buffer) : nullptr;
++
+     // Workspaces
+     const auto workspace_layout = layout::EPWorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
+     const auto host_workspace_layout = layout::EPWorkspaceLayout(mapped_host_workspace, 1, kNumRanks, kNumExperts);
+@@ -80,6 +135,23 @@ dispatch_impl(
+         constexpr int kNumAlignedElems = kNumSmemBytesForNotify / sizeof(int);
+         const auto rank_expert_count = math::advance_ptr<int>(smem, 0);
+ 
++        // EPA arena, step 1 (SM 0): before counting, take the pages each destination used
++        // last call and publish them, so dispatch warps can send without the count
++        if constexpr (kEPAArena) {
++            if (sm_idx == 0) {
++                const auto team_sync = [&]() { ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex); };
++                for (int d = thread_idx; d < kNumRanks; d += kNumNotifyThreads)
++                    epa_want[d] = epa_layout.pred(buffer)[d], epa_first[d] = 0;
++                team_sync();
++                epa_arena_take<team_t, kNumRanks>(epa_layout, buffer, gin, rank_idx, epa_want, epa_first, epa_have,
++                                                  epa_tickets, epa_pfx, thread_idx, kNumNotifyThreads, team_sync);
++                __threadfence();
++                for (int d = thread_idx; d < kNumRanks; d += kNumNotifyThreads)
++                    cuda::atomic_ref<int, cuda::thread_scope_device>(epa_layout.avail(buffer)[d]).store(
++                        epa_have[d], cuda::memory_order_release);
++            }
++        }
++
+         // Clean initial counts
+         // NOTES: if you want to change the order of different warp roles, please take care of the `thread_idx`
+         int *rank_count = rank_expert_count, *expert_count = rank_expert_count + kNumRanks;
+@@ -146,6 +218,53 @@ dispatch_impl(
+             }
+             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+ 
++            // EPA tier 2: reserve each destination's overflow (count - cap) in its pool
++            // with one relaxed NVLink fetch-add, tell the destination where it is, and
++            // publish it to this rank's dispatch warps (`pub`, base + 2)
++            if constexpr (kEPACap >= 0) {
++                EP_STATIC_ASSERT(kIsScaleupNVLink, "EPArena needs the direct NVLink path");
++                const auto epa = layout::EPALayout(
++                    layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true).get_num_bytes<false, int64_t>(),
++                    kNumRanks, kNumMaxTokensPerRank, kEPACap, kEPAPool, kEPATables);
++                for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
++                    const int over = static_cast<int>(epa.win.overflow(math::encode_decode_positive(rank_count[i])));
++                    int base = -1;
++                    if (over > 0 and epa.win.shared > 0)
++                        base = static_cast<int>(epa.win.accept(atomicAdd_system(gin.get_sym_ptr<team_t>(epa.head(buffer), i), over), over));
++                    if (over > 0)
++                        *gin.get_sym_ptr<team_t>(epa.tbl(buffer) + rank_idx, i) = base;
++                    epa.last(buffer)[i] = base;
++                    *reinterpret_cast<volatile int*>(epa.pub(buffer) + i) = base + 2;
++                }
++            } else if constexpr (kEPAArena) {
++                // EPA arena, step 2: reconcile with the count. Take the shortfall, give the
++                // surplus back, publish the final page count (rows beyond it stay in Home)
++                const auto team_sync = [&]() { ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex); };
++                const int P = epa_layout.rows_per_page;
++                for (int d = thread_idx; d < kNumRanks; d += kNumNotifyThreads) {
++                    const int need = (math::encode_decode_positive(rank_count[d]) + P - 1) / P;
++                    epa_want[d] = need > epa_have[d] ? need - epa_have[d] : 0;
++                    epa_first[d] = epa_have[d];
++                }
++                team_sync();
++                epa_arena_take<team_t, kNumRanks>(epa_layout, buffer, gin, rank_idx, epa_want, epa_first, epa_got,
++                                                  epa_tickets, epa_pfx, thread_idx, kNumNotifyThreads, team_sync);
++                __threadfence();
++                for (int d = thread_idx; d < kNumRanks; d += kNumNotifyThreads) {
++                    const int need = (math::encode_decode_positive(rank_count[d]) + P - 1) / P;
++                    const int final_pages = need > epa_have[d] ? epa_have[d] + epa_got[d] : need;
++                    *gin.get_sym_ptr<team_t>(epa_layout.taken(buffer) + rank_idx, d) = final_pages;
++                    cuda::atomic_ref<int, cuda::thread_scope_device>(epa_layout.avail(buffer)[d]).store(
++                        final_pages | layout::EPALayout::kFinal, cuda::memory_order_release);
++                    epa_layout.pred(buffer)[d] = need;
++                    if (epa_have[d] > need) {   // surplus of the prediction (off the send path)
++                        auto da = epa_layout.arena(buffer);
++                        da.base = gin.get_sym_ptr<team_t>(da.base, d);
++                        da.give(epa_layout.ltable(buffer) + d * epa_layout.max_pages + need, epa_have[d] - need);
++                    }
++                }
++            }
++
+             // TODO: for further optimization, we can fuse rank and expert counters
+             // Issue scaleup rank count writes to peers
+             for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+@@ -258,11 +377,32 @@ dispatch_impl(
+     } else {
+         const int dispatch_warp_idx = warp_idx - kNumNotifyWarps;
+ 
++        // EPA arena, cached mode (no notify warps): the counts are last call's, so take
++        // exactly the remembered pages and publish them as final
++        if constexpr (kEPAArena and kReuseSlotIndices) {
++            if (sm_idx == 0 and dispatch_warp_idx == 0) {
++                const auto team_sync = [&]() { __syncwarp(); };
++                for (int d = lane_idx; d < kNumRanks; d += 32)
++                    epa_want[d] = epa_layout.pred(buffer)[d], epa_first[d] = 0;
++                __syncwarp();
++                epa_arena_take<team_t, kNumRanks>(epa_layout, buffer, gin, rank_idx, epa_want, epa_first, epa_got,
++                                                  epa_tickets, epa_pfx, lane_idx, 32, team_sync);
++                __threadfence();
++                for (int d = lane_idx; d < kNumRanks; d += 32) {
++                    *gin.get_sym_ptr<team_t>(epa_layout.taken(buffer) + rank_idx, d) = epa_got[d];
++                    cuda::atomic_ref<int, cuda::thread_scope_device>(epa_layout.avail(buffer)[d]).store(
++                        epa_got[d] | layout::EPALayout::kFinal, cuda::memory_order_release);
++                }
++                __syncwarp();
++            }
++        }
++
+         // Buffer layouts
+         const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+         const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumDispatchWarps, 1,
+             math::advance_ptr<int>(smem, kNumSmemBytesForNotify)).get_rank_buffer(dispatch_warp_idx).get_token_buffer(0);
+         auto recv_buffer = layout::BufferLayout<false>(token_layout, kNumRanks, kNumMaxTokensPerRank, buffer);
++        const auto& epa = epa_layout;
+         auto send_buffer = layout::BufferLayout<false>(token_layout, 1, kNumMaxTokensPerRank, recv_buffer.get_buffer_end_ptr());
+         recv_buffer = recv_buffer.get_rank_buffer(rank_idx);
+ 
+@@ -366,9 +506,57 @@ dispatch_impl(
+ 
+             // Issue TMA NVLink stores
+             EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
+-            const auto dst_ptr = stored_dst_slot_idx >= 0 ?
+-                gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
+-                nullptr;
++            void* dst_ptr = nullptr;
++            if constexpr (kEPACap == -1) {
++                dst_ptr = stored_dst_slot_idx >= 0 ?
++                    gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
++                    nullptr;
++            } else {
++                // EPA window: keyed row, else shared row, else the token stays in Home.
++                // EPA arena: page slot / P of the destination's arena once published.
++                bool spill = false;
++                if constexpr (kEPAArena) {
++                    if (stored_dst_slot_idx >= 0) {
++                        const int p = stored_dst_slot_idx / epa.rows_per_page;
++                        cuda::atomic_ref<int, cuda::thread_scope_device> av(epa.avail(buffer)[stored_dst_rank_idx]);
++                        int a;
++                        while (((a = av.load(cuda::memory_order_acquire)) & ~layout::EPALayout::kFinal) <= p and
++                               not (a & layout::EPALayout::kFinal))
++                            __nanosleep(32);
++                        if ((a & ~layout::EPALayout::kFinal) > p) {
++                            const int id = epa.ltable(buffer)[stored_dst_rank_idx * epa.max_pages + p];
++                            void* local = epa.arena(buffer).page_ptr(id) +
++                                static_cast<int64_t>(stored_dst_slot_idx % epa.rows_per_page) * epa.token_bytes;
++                            dst_ptr = gin.get_sym_ptr<team_t>(local, stored_dst_rank_idx);
++                        } else {
++                            spill = true;
++                        }
++                    }
++                } else if (stored_dst_slot_idx >= 0) {
++                    int base = -1;
++                    if (stored_dst_slot_idx >= epa.win.keyed) {
++                        if constexpr (kReuseSlotIndices) {
++                            base = epa.last(buffer)[stored_dst_rank_idx];
++                        } else {
++                            const volatile int* pub = epa.pub(buffer) + stored_dst_rank_idx;
++                            while ((base = *pub) == 0) __nanosleep(32);
++                            base -= 2;
++                        }
++                    }
++                    void* local = epa.row(buffer, rank_idx, stored_dst_slot_idx, base);
++                    if (local != nullptr)
++                        dst_ptr = gin.get_sym_ptr<team_t>(local, stored_dst_rank_idx);
++                    else
++                        spill = true;
++                }
++                if (__ballot_sync(0xffffffff, spill)) {
++                    // One Home copy per token, one 4-byte descriptor per destination without a window row
++                    if (ptx::elect_one_sync())
++                        ptx::tma_store_1d(epa.home(buffer, token_idx), tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
++                    if (spill)
++                        *gin.get_sym_ptr<team_t>(epa.desc(buffer, rank_idx, stored_dst_slot_idx), stored_dst_rank_idx) = token_idx;
++                }
++            }
+             if (dst_ptr != nullptr)
+                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+             ptx::tma_store_commit();
+@@ -402,6 +590,24 @@ dispatch_impl(
+     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
+         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
++
++    // EPA: every source has reserved in this rank's pool and every local warp has
++    // read `pub` by now (final barrier), so both can be reset for the next call
++    if constexpr (kEPACap >= 0) {
++        const auto epa_bytes = layout::EPALayout(
++            layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true).get_num_bytes<false, int64_t>(),
++            kNumRanks, kNumMaxTokensPerRank, kEPACap, kEPAPool, kEPATables);
++        if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks) {
++            epa_bytes.pub(buffer)[thread_idx] = 0;
++            if (thread_idx == 0)
++                *epa_bytes.head(buffer) = 0;
++        }
++    }
++    // EPA arena: every local send has read `avail` by now (final barrier)
++    if constexpr (kEPAArena) {
++        if (sm_idx == 0 and thread_idx < kNumRanks)
++            epa_layout.avail(buffer)[thread_idx] = 0;
++    }
+ }
+ 
+ }  // namespace deep_ep::ep
+diff --git a/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.cuh b/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.cuh
+index b9c76ec..94a87b7 100644
+--- a/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.cuh
++++ b/deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.cuh
+@@ -3,6 +3,7 @@
+ #include <deep_ep/common/compiled.cuh>
+ #include <deep_ep/common/math.cuh>
+ #include <deep_ep/common/ptx.cuh>
++#include <deep_ep/layout/ep/epa.cuh>
+ #include <deep_ep/layout/ep/token.cuh>
+ #include <deep_ep/layout/ep/workspace.cuh>
+ 
+@@ -16,6 +17,7 @@ template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+           int kNumHiddenBytes, int kNumSFPacks,
+           int kNumMaxTokensPerRank,
+           int kNumExperts, int kNumTopk, int kExpertAlignment,
++          int kEPACap, int kEPAPool, int64_t kEPATables,   // EPArena (see dispatch.cuh); kEPACap < 0: upstream layout
+           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
+           int kNumThreads = kNumWarps * 32,
+           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
+@@ -31,7 +33,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+                             int* num_unaligned_recv_tokens_per_expert,
+                             int num_recv_tokens,
+                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
+-                            const int scaleout_rank_idx, const int scaleup_rank_idx) {
++                            const int scaleout_rank_idx, const int scaleup_rank_idx,
++                            void* const* epa_peer_buffers) {
+     // Utils
+     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
+     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
+@@ -79,7 +82,33 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+             current_rank_start = current_rank_end;
+             current_rank_end = ptx::exchange(stored_psum_num_recv_tokens, stored_lane_idx);
+         }
+-        const auto buffer_token = scaleup_buffer.get_rank_buffer(current_rank_idx).get_token_buffer(i - current_rank_start);
++        auto buffer_token = scaleup_buffer.get_rank_buffer(current_rank_idx).get_token_buffer(i - current_rank_start);
++        if constexpr (kEPACap < -1) {
++            // EPA arena: the source's page, or its Home row read in place over NVLink
++            EP_STATIC_ASSERT(kNumScaleoutRanks == 1, "EPArena needs the direct NVLink path");
++            const auto epa = layout::EPALayout(token_layout.get_num_bytes<false, int64_t>(), kNumScaleupRanks,
++                                               kNumMaxTokensPerRank, kEPACap, kEPAPool, kEPATables);
++            const int j = i - current_rank_start;
++            const int taken = epa.taken(buffer)[current_rank_idx];
++            if (j < taken * epa.rows_per_page) {
++                buffer_token.set_base_ptr(epa.arena(buffer).page_ptr(
++                    epa.rtable(buffer)[current_rank_idx * epa.max_pages + j / epa.rows_per_page]) +
++                    static_cast<int64_t>(j % epa.rows_per_page) * epa.token_bytes);
++            } else {
++                buffer_token.set_base_ptr(epa.home(epa_peer_buffers[current_rank_idx],
++                                                   *epa.desc(buffer, current_rank_idx, j)));
++            }
++        } else if constexpr (kEPACap >= 0) {
++            // EPA: the window row, or the source's Home row read in place over NVLink
++            EP_STATIC_ASSERT(kNumScaleoutRanks == 1, "EPArena needs the direct NVLink path");
++            const auto epa = layout::EPALayout(token_layout.get_num_bytes<false, int64_t>(), kNumScaleupRanks,
++                                               kNumMaxTokensPerRank, kEPACap, kEPAPool, kEPATables);
++            const int j = i - current_rank_start;
++            const int base = j < epa.win.keyed ? -1 : epa.tbl(buffer)[current_rank_idx];
++            void* local = epa.row(buffer, current_rank_idx, j, base);
++            buffer_token.set_base_ptr(local != nullptr ? local :
++                epa.home(epa_peer_buffers[current_rank_idx], *epa.desc(buffer, current_rank_idx, j)));
++        }
+ 
+         // Wait buffer releases
+         ptx::tma_store_wait();
+@@ -323,6 +352,34 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
+             pad_idx += kNumSMs * kNumWarps;
+         }
+     }
++
++    // EPA arena: once every block has copied its rows (all TMA loads from the pages have
++    // completed inside the loop), the last block gives each source's pages back
++    if constexpr (kEPACap < -1) {
++        const auto epa = layout::EPALayout(token_layout.get_num_bytes<false, int64_t>(), kNumScaleupRanks,
++                                           kNumMaxTokensPerRank, kEPACap, kEPAPool, kEPATables);
++        __syncthreads();
++        bool epa_mine = false;
++        if (thread_idx == 0) {
++            __threadfence();
++            epa_mine = atomicAdd(epa.done(buffer), 1) == kNumSMs - 1;
++        }
++        if (__syncthreads_or(epa_mine)) {
++            __threadfence();
++            const auto a = epa.arena(buffer);
++            for (int src = warp_idx; src < kNumScaleupRanks; src += kNumWarps) {
++                const int taken = epa.taken(buffer)[src];
++                if (taken > 0)
++                    a.warp_give(epa.rtable(buffer) + src * epa.max_pages, taken);
++                __syncwarp();
++                if (lane_idx == 0)
++                    epa.taken(buffer)[src] = 0;
++            }
++            __syncthreads();
++            if (thread_idx == 0)
++                *epa.done(buffer) = 0;
++        }
++    }
+ }
+ 
+ }  // namespace deep_ep::ep
+diff --git a/deep_ep/include/deep_ep/layout/ep/epa.cuh b/deep_ep/include/deep_ep/layout/ep/epa.cuh
+new file mode 100644
+index 0000000..8f61394
+--- /dev/null
++++ b/deep_ep/include/deep_ep/layout/ep/epa.cuh
+@@ -0,0 +1,142 @@
++#pragma once
++
++// EPArena (Home + Window, epa/window.cuh) for the direct (NVLink) dispatch receive buffer.
++//
++// Upstream: [num_ranks][num_max_tokens_per_rank] token slots per receiver.
++// EPArena:  a window with one key per source rank (keyed = cap rows each, shared =
++//           pool rows), the sender's Home rows for tokens without a window row, and
++//           small index tables:
++//
++//   window [R*cap + P] tokens   row = win.row(src, j, base): keyed, then shared
++//   home   [T]       tokens   this rank's own tokens, written only for rows left in Home
++//   desc   [R][T]    int32    token index in the source's Home
++// and, at `tables_offset` (the tail of the EP buffer, which combine never touches):
++//   tbl    [R]       int32    pool base of each source (-1: tier 3)
++//   head   1         int32    pool head (NVLink fetch-add by sources)
++//   pub    [R]       int32    pool base per destination, base + 2 (0 = not ready)
++//   last   [R]       int32    pool base per destination of the last non-cached call
++//
++// Cached dispatches reuse `last` and `tbl`: they must follow a non-cached dispatch
++// with the same routing on this buffer.
++//
++// Arena mode (cap < -1: rows per page P = -cap - 1, pool = number of pages N): the
++// receive window becomes an epa::Arena. Its N pages of P tokens sit at the front of the
++// buffer (memory combine reuses: pages are free by then); its ring state and these
++// tables sit at the tail, after the four tables above:
++//   arena  ring state (epa::Arena::meta_bytes(N))
++//   rtable [R][maxp] int32   receiver: page ids per source, written by the sources
++//   taken  [R]       int32   receiver: pages taken per source (rows beyond: Home)
++//   ltable [R][maxp] int32   sender: page ids per destination, for the data warps
++//   avail  [R]       int32   sender: pages usable now | kFinal once counted
++//   pred   [R]       int32   sender: pages per destination last call
++//   done   1         int32   copy-epilogue blocks finished (the last gives the pages back)
++//   scratch          SM 0's per-destination take state (global: no static shared memory,
++//                    which DeepEP's maximal dynamic shared memory leaves no room for)
++#include <deep_ep/common/math.cuh>
++#include <epa/arena.cuh>
++#include <epa/window.cuh>
++
++namespace deep_ep::layout {
++
++struct EPALayout {
++    int64_t token_bytes;
++    int num_ranks, num_max_tokens, cap, pool;
++    int64_t tables_offset;
++    epa::Window win;   // keys = source ranks, keyed = cap, shared = pool
++    bool arena_mode;
++    int rows_per_page, num_pages, max_pages;
++    static constexpr int kFinal = 1 << 30;
++
++    __host__ __device__ EPALayout(const int64_t& token_bytes, const int& num_ranks, const int& num_max_tokens,
++                                  const int& cap, const int& pool, const int64_t& tables_offset) :
++        token_bytes(token_bytes), num_ranks(num_ranks), num_max_tokens(num_max_tokens), cap(cap), pool(pool),
++        tables_offset(tables_offset) {
++        arena_mode = cap < -1;
++        rows_per_page = arena_mode ? -cap - 1 : 0;
++        num_pages = arena_mode ? pool : 0;
++        max_pages = arena_mode ? (num_max_tokens + rows_per_page - 1) / rows_per_page : 0;
++        win.num_keys = num_ranks, win.keyed = arena_mode ? 0 : cap, win.shared = arena_mode ? 0 : pool;
++        win.max_rows = static_cast<int64_t>(num_ranks) * num_max_tokens;
++    }
++
++    // Bytes of the tables at `tables_offset` (arena mode: plus ring state and page tables)
++    __host__ __device__ static int64_t num_table_bytes(const int& num_ranks, const int& cap = -1, const int& pool = 0,
++                                                       const int& num_max_tokens = 0) {
++        const int64_t base = 128 + 3 * math::align<int64_t>(num_ranks * 4, 128);
++        if (cap >= -1) return base;
++        const int64_t maxp = (num_max_tokens + (-cap - 1) - 1) / (-cap - 1);
++        return base + epa::kDataAlign /* alignment slack of arena_offset() */ + epa::Arena::meta_bytes(pool) +
++               2 * math::align<int64_t>(num_ranks * maxp * 4, 128) + 3 * math::align<int64_t>(num_ranks * 4, 128) + 128 +
++               scratch_bytes(num_ranks);
++    }
++
++    // SM 0 scratch: have, want, first, got [R] int32, pfx [R + 1] int32, tickets [R] int64
++    __host__ __device__ static int64_t scratch_bytes(const int& num_ranks) {
++        return math::align<int64_t>(num_ranks * 8, 128) + math::align<int64_t>(num_ranks * 4 * 4 + (num_ranks + 1) * 4, 128);
++    }
++    __host__ __device__ int64_t page_bytes() const { return static_cast<int64_t>(rows_per_page) * token_bytes; }
++    __host__ __device__ int64_t home_offset() const {
++        return arena_mode ? static_cast<int64_t>(num_pages) * page_bytes() : win.rows() * token_bytes;
++    }
++    __host__ __device__ int64_t desc_offset() const { return home_offset() + static_cast<int64_t>(num_max_tokens) * token_bytes; }
++    // End of the per-call data (tier 1, pool, home, descriptors)
++    __host__ __device__ int64_t num_data_bytes() const { return desc_offset() + static_cast<int64_t>(num_ranks) * num_max_tokens * 4; }
++    __host__ __device__ int64_t tbl_offset() const { return tables_offset; }
++    __host__ __device__ int64_t head_offset() const { return tbl_offset() + math::align<int64_t>(num_ranks * 4, 128); }
++    __host__ __device__ int64_t pub_offset() const { return head_offset() + 128; }
++    __host__ __device__ int64_t last_offset() const { return pub_offset() + math::align<int64_t>(num_ranks * 4, 128); }
++
++    // Typed views into a buffer base
++    template <typename T = void>
++    __host__ __device__ static T* at(void* base, const int64_t& offset) {
++        return reinterpret_cast<T*>(static_cast<int8_t*>(base) + offset);
++    }
++    // Window row of source `src`'s j-th token given its shared base; nullptr: in Home
++    __host__ __device__ void* row(void* base, const int& src, const int& j, const int64_t& shared_base) const {
++        const int64_t r = win.row(src, j, shared_base);
++        return r < 0 ? nullptr : at(base, r * token_bytes);
++    }
++    __host__ __device__ void* home(void* base, const int& token) const {
++        return at(base, home_offset() + static_cast<int64_t>(token) * token_bytes);
++    }
++    __host__ __device__ int* desc(void* base, const int& src, const int& j) const {
++        return at<int>(base, desc_offset() + (static_cast<int64_t>(src) * num_max_tokens + j) * 4);
++    }
++    __host__ __device__ int* tbl(void* base) const { return at<int>(base, tbl_offset()); }
++    __host__ __device__ int* head(void* base) const { return at<int>(base, head_offset()); }
++    __host__ __device__ int* pub(void* base) const { return at<int>(base, pub_offset()); }
++    __host__ __device__ int* last(void* base) const { return at<int>(base, last_offset()); }
++
++    // Arena mode
++    __host__ __device__ int64_t arena_offset() const {
++        return math::align<int64_t>(last_offset() + math::align<int64_t>(num_ranks * 4, 128), epa::kDataAlign);
++    }
++    __host__ __device__ int64_t rtable_offset() const { return arena_offset() + epa::Arena::meta_bytes(num_pages); }
++    __host__ __device__ int64_t table_bytes() const { return math::align<int64_t>(int64_t(num_ranks) * max_pages * 4, 128); }
++    __host__ __device__ int64_t taken_offset() const { return rtable_offset() + table_bytes(); }
++    __host__ __device__ int64_t ltable_offset() const { return taken_offset() + math::align<int64_t>(num_ranks * 4, 128); }
++    __host__ __device__ int64_t avail_offset() const { return ltable_offset() + table_bytes(); }
++    __host__ __device__ int64_t pred_offset() const { return avail_offset() + math::align<int64_t>(num_ranks * 4, 128); }
++    __host__ __device__ int64_t done_offset() const { return pred_offset() + math::align<int64_t>(num_ranks * 4, 128); }
++    // The arena of the buffer at `base` (pages at the buffer front, ring state at the tail)
++    __host__ __device__ epa::Arena arena(void* base) const {
++        epa::Arena a;
++        a.base = at<char>(base, arena_offset());
++        a.page_bytes = page_bytes();
++        a.num_pages = num_pages;
++        a.data_off = -arena_offset();
++        return a;
++    }
++    __host__ __device__ int* rtable(void* base) const { return at<int>(base, rtable_offset()); }
++    __host__ __device__ int* taken(void* base) const { return at<int>(base, taken_offset()); }
++    __host__ __device__ int* ltable(void* base) const { return at<int>(base, ltable_offset()); }
++    __host__ __device__ int* avail(void* base) const { return at<int>(base, avail_offset()); }
++    __host__ __device__ int* pred(void* base) const { return at<int>(base, pred_offset()); }
++    __host__ __device__ int* done(void* base) const { return at<int>(base, done_offset()); }
++    __host__ __device__ long long* scratch_tickets(void* base) const { return at<long long>(base, done_offset() + 128); }
++    __host__ __device__ int* scratch_ints(void* base) const {
++        return at<int>(base, done_offset() + 128 + math::align<int64_t>(num_ranks * 8, 128));
++    }
++};
++
++}  // namespace deep_ep::layout

@@ -1,0 +1,26 @@
+[
+ {
+  "T": 1024,
+  "skew": 0.0,
+  "routing": "uniform",
+  "mode": "upstream",
+  "load": null,
+  "buffer_bytes": 499804544,
+  "ring_rows": 19200,
+  "us": 411.0,
+  "hangs": 0,
+  "passed": true
+ },
+ {
+  "T": 1024,
+  "skew": 0.0,
+  "routing": "uniform",
+  "mode": "epa",
+  "load": 2.0,
+  "buffer_bytes": 322811264,
+  "ring_rows": 7680,
+  "us": 411.0,
+  "hangs": 0,
+  "passed": true
+ }
+]

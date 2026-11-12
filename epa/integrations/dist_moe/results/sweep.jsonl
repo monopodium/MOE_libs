@@ -1,0 +1,24 @@
+{"T": 1024, "F": 8.0, "routing": "uniform", "ctx_bytes": 1610622976, "max_recv_rows": 6264, "mean_recv_rows": 6144, "capacity_rows": 49152, "us": 3578.06396484375, "checksum": 38410.71875}
+{"T": 1024, "F": 2.0, "routing": "uniform", "ctx_bytes": 402663424, "max_recv_rows": 6264, "mean_recv_rows": 6144, "capacity_rows": 12288, "us": 3435.296142578125, "checksum": 38410.71875}
+{"T": 1024, "F": 1.25, "routing": "uniform", "ctx_bytes": 251668480, "max_recv_rows": 6264, "mean_recv_rows": 6144, "capacity_rows": 7680, "us": 3460.800048828125, "checksum": 38410.71875}
+{"T": 1024, "F": 1, "routing": "uniform", "failed": true, "why": "capacity"}
+{"T": 1024, "F": 8.0, "routing": "skew", "ctx_bytes": 1610622976, "max_recv_rows": 6386, "mean_recv_rows": 6144, "capacity_rows": 49152, "us": 3501.02392578125, "checksum": 53622.26953125}
+{"T": 1024, "F": 2.0, "routing": "skew", "ctx_bytes": 402663424, "max_recv_rows": 6386, "mean_recv_rows": 6144, "capacity_rows": 12288, "us": 3503.23193359375, "checksum": 53622.26953125}
+{"T": 1024, "F": 1.25, "routing": "skew", "ctx_bytes": 251668480, "max_recv_rows": 6386, "mean_recv_rows": 6144, "capacity_rows": 7680, "us": 3477.968017578125, "checksum": 53622.26953125}
+{"T": 1024, "F": 1, "routing": "skew", "failed": true, "why": "capacity"}
+{"T": 1024, "F": 8.0, "routing": "extreme", "ctx_bytes": 1610622976, "max_recv_rows": 10533, "mean_recv_rows": 6144, "capacity_rows": 49152, "us": 3633.008056640625, "checksum": 53627.71875}
+{"T": 1024, "F": 2.0, "routing": "extreme", "ctx_bytes": 402663424, "max_recv_rows": 10533, "mean_recv_rows": 6144, "capacity_rows": 12288, "us": 3645.407958984375, "checksum": 53627.71875}
+{"T": 1024, "F": 1.25, "routing": "extreme", "failed": true, "why": "capacity"}
+{"T": 1024, "F": 1, "routing": "extreme", "failed": true, "why": "capacity"}
+{"T": 4096, "F": 8.0, "routing": "uniform", "ctx_bytes": 6442461184, "max_recv_rows": 24748, "mean_recv_rows": 24576, "capacity_rows": 196608, "us": 5246.49609375, "checksum": 153500.71875}
+{"T": 4096, "F": 2.0, "routing": "uniform", "ctx_bytes": 1610622976, "max_recv_rows": 24748, "mean_recv_rows": 24576, "capacity_rows": 49152, "us": 5144.3359375, "checksum": 153500.71875}
+{"T": 4096, "F": 1.25, "routing": "uniform", "ctx_bytes": 1006643200, "max_recv_rows": 24748, "mean_recv_rows": 24576, "capacity_rows": 30720, "us": 5162.94384765625, "checksum": 153500.71875}
+{"T": 4096, "F": 1, "routing": "uniform", "failed": true, "why": "capacity"}
+{"T": 4096, "F": 8.0, "routing": "skew", "ctx_bytes": 6442461184, "max_recv_rows": 25595, "mean_recv_rows": 24576, "capacity_rows": 196608, "us": 4946.56005859375, "checksum": 214546.421875}
+{"T": 4096, "F": 2.0, "routing": "skew", "ctx_bytes": 1610622976, "max_recv_rows": 25595, "mean_recv_rows": 24576, "capacity_rows": 49152, "us": 4936.60791015625, "checksum": 214546.421875}
+{"T": 4096, "F": 1.25, "routing": "skew", "ctx_bytes": 1006643200, "max_recv_rows": 25595, "mean_recv_rows": 24576, "capacity_rows": 30720, "us": 4915.31201171875, "checksum": 214546.421875}
+{"T": 4096, "F": 1, "routing": "skew", "failed": true, "why": "capacity"}
+{"T": 4096, "F": 8.0, "routing": "extreme", "ctx_bytes": 6442461184, "max_recv_rows": 42488, "mean_recv_rows": 24576, "capacity_rows": 196608, "us": 6055.8876953125, "checksum": 217621.0625}
+{"T": 4096, "F": 2.0, "routing": "extreme", "ctx_bytes": 1610622976, "max_recv_rows": 42488, "mean_recv_rows": 24576, "capacity_rows": 49152, "us": 6724.64013671875, "checksum": 217621.0625}
+{"T": 4096, "F": 1.25, "routing": "extreme", "failed": true, "why": "capacity"}
+{"T": 4096, "F": 1, "routing": "extreme", "failed": true, "why": "capacity"}

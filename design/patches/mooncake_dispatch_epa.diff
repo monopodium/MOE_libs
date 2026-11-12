@@ -1,0 +1,273 @@
+--- Mooncake/mooncake-ep/include/mooncake_ep_dispatch.cuh	2026-10-29 16:43:39.964986848 -0700
++++ epa/integrations/mooncake/epa_dispatch.cuh	2026-10-30 13:57:26.125290293 -0700
+@@ -9,7 +9,11 @@
+ #include <mooncake_ep_utils.cuh>
+ #include <transport/device/comm_device.cuh>
+ 
+-namespace mooncake {
++#include <epa/window.cuh>
++
++namespace mooncake_epa {
++
++using namespace mooncake;
+ 
+ using mooncake::device::CommCtx;
+ using mooncake::device::make_comm_ctx;
+@@ -65,6 +69,13 @@
+     int64_t timeout_ticks;
+     int phases;
+     int active_qps_per_rank;
++    // EPArena: tier-1 slots per (local expert, source rank) and descriptor table
++    epa::Window epa_win;   // keys = (local expert, source); keyed = tier-1 rows, shared = pool
++    int* epa_recv_desc;
++    int* epa_pool_head;
++    int* epa_pool_tbl;
++    int* epa_pool_base_local;
++    int* epa_stats;   // [2] messages placed in tier 2 / tier 3 (receiver side)
+ };
+ 
+ static_assert(std::is_trivially_copyable<DispatchKernelArgs>::value,
+@@ -108,6 +119,12 @@
+     int64_t timeout_ticks = args.timeout_ticks;
+     int phases = args.phases;
+     int active_qps_per_rank = args.active_qps_per_rank;
++    const epa::Window epa_win = args.epa_win;
++    int* epa_recv_desc = args.epa_recv_desc;
++    int* epa_pool_head = args.epa_pool_head;
++    int* epa_pool_tbl = args.epa_pool_tbl;
++    int* epa_pool_base_local = args.epa_pool_base_local;
++    int* epa_stats = args.epa_stats;
+ 
+     const auto sm_id = static_cast<int>(blockIdx.x);
+     const auto thread_id = static_cast<int>(threadIdx.x);
+@@ -257,14 +274,30 @@
+                     slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                     const auto src_ptr =
+                         reinterpret_cast<const void*>(rdma_x_src_idx);
++                    // EPA window: keyed row, else shared row, else -1 (stays in Home)
++                    const int epa_key = dst_expert_local_idx * num_ranks + rank;
++                    int64_t epa_base = -1;
++                    if (slot_idx >= epa_win.keyed) {
++                        int pool_base = 0;
++                        if (lane_id == 0) {
++                            const volatile int* pb = epa_pool_base_local + dst_expert_idx;
++                            while ((pool_base = *pb) == 0) __nanosleep(32);
++                        }
++                        epa_base = __shfl_sync(0xffffffff, pool_base, 0) - 2;
++                    }
++                    const int64_t epa_row = epa_win.row(epa_key, slot_idx, epa_base);
++                    if (epa_row < 0) {
++                        // EPA: the message stays in the Home row, push its descriptor
++                        if (lane_id == 0) {
++                            int* desc = epa_recv_desc +
++                                static_cast<int64_t>(epa_key) * num_max_dispatch_tokens_per_rank + slot_idx;
++                            *reinterpret_cast<int*>(mc_route_put(comm_ctx, dst_rank, desc)) =
++                                (warp_id << 24) | token_idx;
++                        }
++                    } else {
+                     const auto dst_ptr = reinterpret_cast<void*>(
+                         reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
+-                        dst_expert_local_idx * num_ranks *
+-                            num_max_dispatch_tokens_per_rank *
+-                            num_bytes_per_msg +
+-                        rank * num_max_dispatch_tokens_per_rank *
+-                            num_bytes_per_msg +
+-                        slot_idx * num_bytes_per_msg);
++                        epa_row * num_bytes_per_msg);
+ 
+                     void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
+                     if (write_dst != nullptr) {
+@@ -279,6 +312,9 @@
+                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg,
+                                            dst_int4_ptr, src_int4_ptr, mc_ld_nc,
+                                            mc_st_na);
++                        // EPA: the top-k position travels in header int 1
++                        if (lane_id == 0)
++                            reinterpret_cast<int*>(write_dst)[1] = warp_id;
+ #ifndef MOONCAKE_EP_USE_MUSA
+                         mc_fence();
+ #endif
+@@ -304,6 +340,7 @@
+                         }
+ #endif
+                     }
++                    }  // EPA tier 1
+                 }
+ 
+                 // Increase counter after finishing
+@@ -337,32 +374,10 @@
+     }
+     if (is_count_worker) {
+         EP_DEVICE_ASSERT(num_sms > 1);
+-        if (sm_id == 0) {
+-// The first SM is also responsible for cleaning the next buffer
+-#pragma unroll
+-            for (int i = lane_id; i < qp_num_ranks * num_local_experts; i += 32)
+-                next_clean_buffer[i] = 0;
+-
+-            // Notify before executing `int_p`
+-            __syncwarp();
+-#ifdef MOONCAKE_EP_USE_MUSA
+-            // Publish the cleared buffer once before any local ready tag.
+-            mc_fence();
+-            __syncwarp();
+-#endif
+-#pragma unroll
+-            for (int i = lane_id; i < num_experts; i += 32)
+-#ifdef MOONCAKE_EP_USE_MUSA
+-                mc_atomic_add_relaxed(atomic_finish_counter_per_expert + i,
+-                                      FINISHED_SUM_TAG);
+-#else
+-                mc_atomic_add_release(atomic_finish_counter_per_expert + i,
+-                                      FINISHED_SUM_TAG);
+-#endif
+-        }
+-
+-        // This SM should be responsible for some destination experts, read
+-        // `topk_idx` for them
++        // EPA: count first. The sys-scope release operations below wait for this
++        // SM's outstanding NVLink stores, so anything placed after them (like the
++        // tier-2 reservation that data warps wait on) would be serialized behind
++        // the whole tier-1 send.
+         int expert_count[kNumWarpGroups] = {0};
+         const auto expert_begin_idx = sm_id * kNumWarpGroups;
+         const auto expert_end_idx =
+@@ -376,23 +391,52 @@
+                 expert_count[idx - expert_begin_idx]++;
+         }
+ 
+-// Warp reduce
++// Warp reduce: lane j keeps the count of expert begin + j
++        int lane_sum = 0;
+ #pragma unroll
+         for (int i = expert_begin_idx; i < expert_end_idx; ++i) {
+-            auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
+-            if (lane_id == 0) {
+-                shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
+-#ifdef MOONCAKE_EP_USE_MUSA
+-                // Local completion accounting; payload publication is fenced
+-                // by the expert's signal sender after the count reaches its
+-                // tag.
+-                mc_atomic_add_relaxed(atomic_finish_counter_per_expert + i,
+-                                      FINISHED_SUM_TAG - sum);
+-#else
++            const auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
++            if (lane_id == i - expert_begin_idx) lane_sum = sum;
++        }
++
++        // EPA tier 2: reserve this rank's overflow (count - cap) in the receiver's
++        // pool with one relaxed NVLink fetch-add, tell the receiver where it is,
++        // and publish it to the local data warps (0 = not ready, base + 2).
++        // Relaxed is enough: the base orders no data.
++        const bool owns_expert = lane_id < expert_end_idx - expert_begin_idx;
++        if (owns_expert) {
++            const int i = expert_begin_idx + lane_id;
++            const int dst_rank_ = i / num_local_experts, e_local_ = i % num_local_experts;
++            const int over = static_cast<int>(epa_win.overflow(lane_sum));
++            int base = -1;
++            if (over > 0 and epa_win.shared > 0 and active_ranks[dst_rank_])
++                base = static_cast<int>(epa_win.accept(
++                    atomicAdd_system(reinterpret_cast<int*>(mc_route_put(comm_ctx, dst_rank_, epa_pool_head)), over), over));
++            if (over > 0)
++                *reinterpret_cast<int*>(mc_route_put(comm_ctx, dst_rank_,
++                    epa_pool_tbl + e_local_ * num_ranks + rank)) = base;
++            *reinterpret_cast<volatile int*>(epa_pool_base_local + i) = base + 2;
++        }
++        __syncwarp();
++
++        if (sm_id == 0) {
++// The first SM is also responsible for cleaning the next buffer
++#pragma unroll
++            for (int i = lane_id; i < qp_num_ranks * num_local_experts + 1; i += 32)  // EPA: + pool head
++                next_clean_buffer[i] = 0;
++
++            // Notify before executing `int_p`
++            __syncwarp();
++#pragma unroll
++            for (int i = lane_id; i < num_experts; i += 32)
+                 mc_atomic_add_release(atomic_finish_counter_per_expert + i,
+-                                      FINISHED_SUM_TAG - sum);
+-#endif
+-            }
++                                      FINISHED_SUM_TAG);
++        }
++
++        if (owns_expert) {
++            shared_num_tokens_sent_per_expert[lane_id] = lane_sum;
++            mc_atomic_add_release(atomic_finish_counter_per_expert + expert_begin_idx + lane_id,
++                                  FINISHED_SUM_TAG - lane_sum);
+         }
+     }
+ #ifdef MOONCAKE_EP_USE_MUSA
+@@ -444,6 +488,7 @@
+         // Clean workspace for next use
+         atomic_counter_per_expert[responsible_expert_idx] = 0;
+         atomic_finish_counter_per_expert[responsible_expert_idx] = 0;
++        epa_pool_base_local[responsible_expert_idx] = 0;
+ 
+         // Clean `packed_recv_count`
+         if (dst_rank == 0) packed_recv_count[dst_expert_local_idx] = 0;
+@@ -463,11 +508,14 @@
+         const auto src_rank = responsible_expert_idx / num_local_experts;
+         const auto local_expert_idx =
+             responsible_expert_idx % num_local_experts;
++        const int epa_key = local_expert_idx * num_ranks + src_rank;
+         const auto rdma_recv_x_uint8 =
+             reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) +
+-            local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank *
+-                num_bytes_per_msg +
+-            src_rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg;
++            epa_win.row(epa_key, 0) * num_bytes_per_msg;
++        const int* epa_desc = epa_recv_desc +
++            static_cast<int64_t>(epa_key) * num_max_dispatch_tokens_per_rank;
++        const auto epa_peer_home = reinterpret_cast<const uint8_t*>(
++            mc_route_put(comm_ctx, src_rank, rdma_send_data_buffer));
+         const auto recv_x_int4 = reinterpret_cast<int4*>(packed_recv_x) +
+                                  local_expert_idx * num_ranks *
+                                      num_max_dispatch_tokens_per_rank *
+@@ -524,17 +572,34 @@
+         mc_bar_sync(warp_group_id + 2, kNumWarpsPerGroup * 32);
+         num_recv_tokens = shared_num_recv_tokens[warp_group_id];
+         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
++        // EPA tier 2: where this pair's overflow landed in the pool (-1: tier 3)
++        const int epa_over = static_cast<int>(epa_win.overflow(num_recv_tokens));
++        const int epa_pool_base = epa_over > 0 ?
++            *reinterpret_cast<const volatile int*>(epa_pool_tbl + epa_key) : -1;
++        if (epa_stats != nullptr and sub_warp_id == 0 and lane_id == 0 and epa_over > 0)
++            atomicAdd(epa_stats + (epa_pool_base >= 0 ? 0 : 1), epa_over);
+ 
+         // Copy tokens
+         EP_DEVICE_ASSERT(num_scales <= 64);
+         mc_fence();
+         for (int i = sub_warp_id; i < num_recv_tokens; i += kNumWarpsPerGroup) {
+             // Copy source info
+-            const auto src_src_idx = reinterpret_cast<int*>(
+-                rdma_recv_x_uint8 + i * num_bytes_per_msg);
+-            if (lane_id == 0)
+-                recv_src_info[recv_token_begin_idx + i] =
+-                    mc_ld_nc_s32(src_src_idx);
++            int* src_src_idx;
++            const int64_t epa_row = epa_win.row(epa_key, i, epa_pool_base);
++            if (epa_row >= 0) {
++                src_src_idx = reinterpret_cast<int*>(
++                    reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) + epa_row * num_bytes_per_msg);
++                if (lane_id == 0)
++                    recv_src_info[recv_token_begin_idx + i] =
++                        (mc_ld_nc_s32(src_src_idx + 1) << 24) | mc_ld_nc_s32(src_src_idx);
++            } else {
++                // EPA: read the row in place from the sender's Home over NVLink
++                const int desc = *reinterpret_cast<const volatile int*>(epa_desc + i);
++                src_src_idx = reinterpret_cast<int*>(const_cast<uint8_t*>(
++                    epa_peer_home + static_cast<int64_t>(desc & 0xffffff) * num_bytes_per_msg));
++                if (lane_id == 0)
++                    recv_src_info[recv_token_begin_idx + i] = desc;
++            }
+             __syncwarp();
+ 
+             // Copy data
+@@ -583,4 +648,4 @@
+         args);
+ }
+ 
+-}  // namespace mooncake
++}  // namespace mooncake_epa
