@@ -564,13 +564,32 @@ static void bf16_gemm_tt(const torch::Tensor& a,
     bf16_gemm_nt(a.transpose(0, 1), b, d, c, compiled_dims, alpha, epilogue_class);
 }
 
+// EPArena (epa/row_pull.cuh): (stage, seg_header, base_row, stamps) -> a RowPull. Row j of the
+// stage is logical row base_row + j of the segment behind seg_header; stamps: int64
+// [>= RowPull::stamp_count(rows of stage)], zeroed once, private to this stage.
+using EPARowPullArgs = std::tuple<torch::Tensor, torch::Tensor, int, torch::Tensor>;
+static epa::RowPull make_epa_row_pull(const std::optional<EPARowPullArgs>& args) {
+    if (not args.has_value())
+        return epa::RowPull::disabled();
+    const auto& [stage, seg_header, base_row, stamps] = *args;
+    DG_HOST_ASSERT(stage.dim() == 2 and stage.is_contiguous() and stage.is_cuda());
+    DG_HOST_ASSERT((stage.size(1) * stage.element_size()) % 16 == 0 and base_row >= 0);
+    DG_HOST_ASSERT(seg_header.scalar_type() == torch::kInt and seg_header.is_cuda());
+    DG_HOST_ASSERT(stamps.scalar_type() == torch::kLong and stamps.is_contiguous());
+    DG_HOST_ASSERT(stamps.numel() >= epa::RowPull::stamp_count(stage.size(0)));
+    return epa::RowPull{seg_header.data_ptr<int>(), stage.data_ptr(),
+                        reinterpret_cast<unsigned long long*>(stamps.data_ptr()), base_row,
+                        static_cast<int>(stage.size(1) * stage.element_size()), static_cast<int>(stage.size(0))};
+}
+
 static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torch::Tensor& b,
                                               const torch::Tensor& d, const torch::Tensor& grouped_layout,
                                               const std::string& compiled_dims,
                                               const bool& use_psum_layout,
                                               const bool& ensure_zero_padding,
                                               const std::optional<int>& expected_m_for_psum_layout,
-                                              const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                                              const std::shared_ptr<EpilogueClass>& epilogue_class,
+                                              const std::optional<EPARowPullArgs>& epa_prefetch = std::nullopt) {
     // Shape must be `[M, K] @ [G, N, K].mT`
     const auto major_a = get_major_type_ab(a);
     const auto major_b = get_major_type_ab(b);
@@ -616,10 +635,40 @@ static void m_grouped_bf16_gemm_nt_contiguous(const torch::Tensor& a, const torc
         sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
                                              num_groups, m, n, k, major_a, major_b, compiled_dims,
                                              use_psum_layout, ensure_zero_padding, expected_m_for_psum_layout,
-                                             resolve_epilogue_class(epilogue_class, std::nullopt, d));
+                                             resolve_epilogue_class(epilogue_class, std::nullopt, d),
+                                             epa::RowPull::disabled(), make_epa_row_pull(epa_prefetch));
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
+}
+
+// EPArena row pull (epa/row_pull.cuh): `a` is a local stage whose row j is logical row
+// `base_row + j` of the EPArena segment behind `seg_header`; the GEMM pulls each tile's rows
+// into it (from this GPU or a lender) right before loading them, so no separate copy runs.
+// Rows a previous launch prefetched (`epa_prefetch` of any grouped BF16 GEMM) are not copied again.
+static void m_grouped_bf16_gemm_nt_contiguous_epa_pull(const torch::Tensor& a, const torch::Tensor& b,
+                                                       const torch::Tensor& d, const torch::Tensor& grouped_layout,
+                                                       const torch::Tensor& seg_header, const int& base_row,
+                                                       const torch::Tensor& stamps,
+                                                       const std::string& compiled_dims,
+                                                       const bool& ensure_zero_padding,
+                                                       const std::optional<EPARowPullArgs>& epa_prefetch) {
+    const auto [m, k] = get_shape<2>(a);
+    const auto [num_groups, n, k_] = get_shape<3>(b);
+    const auto [m_, n_] = get_shape<2>(d);
+    DG_HOST_ASSERT(m == m_ and n == n_ and k == k_ and m > 0 and n > 0 and k > 0);
+    DG_HOST_ASSERT(get_major_type_ab(a) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(a.scalar_type() == torch::kBFloat16 and b.scalar_type() == torch::kBFloat16 and d.scalar_type() == torch::kBFloat16);
+    DG_HOST_ASSERT(grouped_layout.is_contiguous() and grouped_layout.scalar_type() == torch::kInt and grouped_layout.numel() == num_groups);
+    check_major_type_cd(d);
+    DG_HOST_ASSERT(jit->device.get_arch_major() == 10);
+
+    sm100_m_grouped_bf16_gemm_contiguous(a, b, d, grouped_layout,
+                                         num_groups, m, n, k, get_major_type_ab(a), get_major_type_ab(b), compiled_dims,
+                                         true, ensure_zero_padding, std::nullopt,
+                                         resolve_epilogue_class(nullptr, std::nullopt, d),
+                                         make_epa_row_pull(EPARowPullArgs{a, seg_header, base_row, stamps}),
+                                         make_epa_row_pull(epa_prefetch));
 }
 
 static void m_grouped_bf16_gemm_nn_contiguous(const torch::Tensor& a, const torch::Tensor& b,
@@ -959,7 +1008,14 @@ static void register_apis(pybind11::module_& m) {
           py::arg("use_psum_layout") = false,
           py::arg("ensure_zero_padding") = true,
           py::arg("expected_m_for_psum_layout") = std::nullopt,
-          py::arg("epilogue") = nullptr);
+          py::arg("epilogue") = nullptr,
+          py::arg("epa_prefetch") = std::nullopt);
+    m.def("m_grouped_bf16_gemm_nt_contiguous_epa_pull", &m_grouped_bf16_gemm_nt_contiguous_epa_pull,
+          py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
+          py::arg("seg_header"), py::arg("base_row"), py::arg("stamps"),
+          py::arg("compiled_dims") = "nk",
+          py::arg("ensure_zero_padding") = true,
+          py::arg("epa_prefetch") = std::nullopt);
     m.def("m_grouped_bf16_gemm_nn_contiguous", &m_grouped_bf16_gemm_nn_contiguous,
           py::arg("a"), py::arg("b"), py::arg("d"), py::arg("grouped_layout"),
           py::arg("compiled_dims") = "nk",

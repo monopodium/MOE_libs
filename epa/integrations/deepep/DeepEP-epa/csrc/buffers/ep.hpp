@@ -1037,7 +1037,8 @@ public:
             const bool& async_with_compute_stream,
             const bool& allocate_on_comm_stream,
             const bool& use_expanded_layout_in,
-            const bool& defer_epilogue) const {
+            const bool& defer_epilogue,
+            const std::optional<torch::Tensor>& out) const {
         const bool use_expanded_layout = use_expanded_layout_in or (epa_out_p > 0 and epa_out_normal);
         // Check SM count
         EP_HOST_ASSERT(num_sms > 0 and num_sms <= jit->device.get_num_sms());
@@ -1053,6 +1054,9 @@ public:
 
         // Check tensors at dispatch
         const auto [num_combined_tokens, num_topk] = get_shape<2>(combined_topk_idx);
+        if (out.has_value())
+            EP_HOST_ASSERT(out->is_cuda() and out->is_contiguous() and out->scalar_type() == torch::kBFloat16 and
+                           out->size(0) == num_combined_tokens and out->size(1) == hidden);
         const auto [num_scaleup_ranks] = get_shape<1>(psum_num_recv_tokens_per_scaleup_rank);
         EP_HOST_ASSERT(combined_topk_idx.is_cuda() and combined_topk_idx.is_contiguous());
         EP_HOST_ASSERT(combined_topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
@@ -1162,7 +1166,8 @@ public:
         auto epilogue = [=, this](const at::cuda::CUDAStream& stream,
                                   const std::optional<std::reference_wrapper<tensor_list_t>>& tensors_to_record_opt) {
             // Allocate output tensors
-            auto combined_x = torch::empty({num_combined_tokens, hidden}, x.options());
+            // `out` (optional): the caller's buffer for the result, e.g. memory that is dead by now
+            auto combined_x = out.has_value() ? *out : torch::empty({num_combined_tokens, hidden}, x.options());
             auto combined_topk_weights = std::optional<torch::Tensor>();
             float* combined_topk_weights_ptr = nullptr;
             if (topk_weights.has_value()) {

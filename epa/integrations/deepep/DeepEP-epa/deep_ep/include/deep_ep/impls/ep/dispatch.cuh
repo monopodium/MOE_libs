@@ -297,11 +297,6 @@ dispatch_impl(
                     sys_int(hd[1]).store(e, cuda::memory_order_release);
                     const int need = max(0, total - C);
                     int got = 0, n = 0;
-                    if (const int spill = min(need, hd[8]); spill > 0) {   // local spill scratch first: no NVLink
-                        int* ch = hd + 16;
-                        ch[0] = kNumRanks, ch[1] = C, ch[2] = spill, ch[3] = 0;
-                        n = 1, got = spill;
-                    }
                     for (int k = 1; k < kNumRanks and got < need and n < layout::EPASeg::kMaxChunks; ++ k) {
                         const int d = (rank_idx + k) % kNumRanks;
                         int* ph = reinterpret_cast<int*>(reinterpret_cast<char*>(seg.bases()[d]) - layout::EPASeg::kHeaderBytes);
@@ -316,7 +311,7 @@ dispatch_impl(
                             ++ n, got += q;
                         }
                     }
-                    hd[4] = n, hd[6] = need - got, hd[7] += max(0, got - min(need, hd[8]));
+                    hd[4] = n, hd[6] = need - got, hd[7] += got;
                     __threadfence_system();
                 }
             }

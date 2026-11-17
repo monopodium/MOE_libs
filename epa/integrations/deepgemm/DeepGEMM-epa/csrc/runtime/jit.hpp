@@ -19,7 +19,7 @@ inline void init_jit(const std::string& library_root_path) {
         "DG",
         "cutlass-" + std::to_string(CUTLASS_VERSION),
         {include_dir},
-        {"deep_gemm/"});
+        {"deep_gemm/", "epa/"});   // epa/ too: EPArena headers (row_pull.cuh) change kernels
 
     jit = deep_jit::LazyInit<deep_jit::Runtime<deep_jit::CUDA>>([config] {
         auto runtime = std::make_shared<deep_jit::Runtime<deep_jit::CUDA>>(config);

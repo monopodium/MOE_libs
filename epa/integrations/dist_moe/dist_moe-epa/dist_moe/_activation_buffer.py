@@ -1986,6 +1986,8 @@ class ForwardPlan:
     packed_offsets: torch.Tensor | None = None
     # Present only for block-scaled activation-buffer plans.
     blockscaled: BlockscaledForwardPlan | None = None
+    # EPArena elastic frame: [1] int64 rows the scratch tensors hold (None: all rows)
+    frame_rows: torch.Tensor | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2103,6 +2105,10 @@ class BackwardPlan:
     grad_h1_offset: torch.Tensor
     # Present only for block-scaled activation-buffer plans.
     blockscaled: BlockscaledBackwardPlan | None = None
+    # EPArena elastic frame: [1] int64 rows the scratch tensors hold (None: all rows)
+    frame_rows: torch.Tensor | None = None
+    # EPArena lean layout: [1] int64, 1 when x_gathered must be pulled again before W13 WGRAD
+    lean: torch.Tensor | None = None
 
 
 def _get_blockscaled_forward_plan(
@@ -2325,6 +2331,7 @@ def get_forward_plan(
     inference_mode: bool = False,
     num_recv_tokens_per_rank_snapshot: torch.Tensor | None = None,
     scratch_only: bool = False,
+    frame: bool = False,
 ) -> ForwardPlan:
     """Create a forward execution plan for distributed MoE layer.
 
@@ -2357,6 +2364,9 @@ def get_forward_plan(
             per-rank counts consumed by the corresponding backward pass.
         scratch_only: If True, use shared scratch without changing saved-state
             pointers because no backward can consume this forward.
+        frame: EPArena elastic frame. Scratch tensors hold only the rows that
+            fit above the last activation slot (``ForwardPlan.frame_rows``);
+            the caller runs the GEMMs in rounds of that many rows.
 
     Returns:
         ForwardPlan with the recompute decision and memory offsets. BF16 packs
@@ -2421,6 +2431,7 @@ def get_forward_plan(
     )
 
     N = buffer_status.num_activation_slots
+    frame_rows = torch.empty(1, dtype=torch.int64, device=device) if frame else None
 
     # Launch kernel with single thread block
     # NOTE: buffer_offsets and saved_activation_bytes_per_rank are updated IN-PLACE
@@ -2447,6 +2458,8 @@ def get_forward_plan(
         moe_layer_id_ptr=buffer_status.moe_layer_id,
         num_moe_layers=_num_moe_layers_in_selected_slot,
         scratch_only=scratch_only,
+        frame_rows_ptr=frame_rows,
+        FRAME=frame,
     )
 
     # Parse individual offsets from the tensor:
@@ -2469,6 +2482,7 @@ def get_forward_plan(
         h3_offset=h3_offset,
         activation_slot_id_1=selection,
         packed_offsets=fwd_offsets,
+        frame_rows=frame_rows,
     )
 
     # buffer_status.buffer_offsets and buffer_status.saved_activation_bytes_per_rank
@@ -2483,6 +2497,8 @@ def get_backward_plan(
     forward_plan: ForwardPlan,
     buffer_status: ActivationBuffer,
     model_config: ModelConfig,
+    frame: bool = False,
+    lean: bool = True,
 ) -> BackwardPlan:
     """Create a backward execution plan for distributed MoE layer.
 
@@ -2537,6 +2553,7 @@ def get_backward_plan(
     bwd_offsets = torch.empty(6, dtype=torch.int64, device=device)
 
     N = buffer_status.num_activation_slots
+    frame_out = torch.empty(2, dtype=torch.int64, device=device) if frame else None   # rows, lean
 
     # Launch kernel with single thread block
     # NOTE: buffer_offsets and saved_activation_bytes_per_rank are updated IN-PLACE
@@ -2563,6 +2580,9 @@ def get_backward_plan(
         buffer_size=buffer_status.buffer.numel(),
         num_activation_slots=N,
         moe_layer_id_ptr=buffer_status.moe_layer_id,
+        frame_rows_ptr=frame_out,
+        FRAME=frame,
+        LEAN=lean,
     )
 
     # Parse offsets from the tensor
@@ -2583,6 +2603,8 @@ def get_backward_plan(
         grad_h2_offset=grad_h2_offset,
         grad_h3_gathered_offset=grad_h3_gathered_offset,
         grad_h1_offset=grad_h1_offset,
+        frame_rows=None if frame_out is None else frame_out[:1],
+        lean=None if frame_out is None else frame_out[1:],
     )
 
     # buffer_status.buffer_offsets and buffer_status.saved_activation_bytes_per_rank

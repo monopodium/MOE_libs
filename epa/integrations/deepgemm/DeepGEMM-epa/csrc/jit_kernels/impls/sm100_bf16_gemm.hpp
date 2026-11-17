@@ -10,6 +10,8 @@
 #include "epilogue_class.hpp"
 #include "runtime_utils.hpp"
 
+#include <epa/row_pull.cuh>
+
 namespace deep_gemm {
 
 class SM100BF16GemmRuntime final {
@@ -24,6 +26,8 @@ public:
         CUtensorMap tensor_map_b;
         CUtensorMap tensor_map_cd;
         std::shared_ptr<EpilogueClass> epilogue_class;
+        epa::RowPull row_pull = epa::RowPull::disabled();       // A pulled from an EPArena segment
+        epa::RowPull row_prefetch = epa::RowPull::disabled();   // a later launch's stage, filled ahead
     };
 
     static void compile_and_launch(const std::string& tag, const Args& args) {
@@ -47,6 +51,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -67,14 +72,14 @@ static void __instantiate_kernel() {{
         to_string(args.gemm_desc.gemm_type), args.gemm_desc.with_accumulation,
         to_string(args.gemm_desc.cd_dtype),
         args.epilogue_class->get_epilogue_operator_type(),
-        args.gemm_desc.tc_util), args.epilogue_class->compiler_options());
+        args.gemm_desc.tc_util, args.row_pull.enabled() or args.row_prefetch.enabled()), args.epilogue_class->compiler_options());
 
         // Launch
         jit->launch(
             kernel, args.options,
             args.grouped_layout, args.gemm_desc.m, args.gemm_desc.n, args.gemm_desc.k, args.epilogue_class->make_epilogue_operator_args(args.gemm_desc.m, args.gemm_desc.n),
             args.tensor_map_a, args.tensor_map_b,
-            args.tensor_map_cd
+            args.tensor_map_cd, args.row_pull, args.row_prefetch
         );
     }
 };
@@ -145,7 +150,9 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                  const bool& use_psum_layout,
                                                  const bool& ensure_zero_padding,
                                                  const std::optional<int>& expected_m_for_psum_layout,
-                                                 const std::shared_ptr<EpilogueClass>& epilogue_class) {
+                                                 const std::shared_ptr<EpilogueClass>& epilogue_class,
+                                                 epa::RowPull row_pull = epa::RowPull::disabled(),
+                                                 epa::RowPull row_prefetch = epa::RowPull::disabled()) {
     const auto gemm_type = use_psum_layout ?
         GemmType::MGroupedContiguousWithPsumLayout : GemmType::MGroupedContiguous;
 
@@ -189,6 +196,12 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
                                                 static_cast<int>(d.stride(-2)), 1,
                                                 config.storage_config.swizzle_cd_mode);
 
+    // EPArena row pull / prefetch: run on the spare warps 2-3
+    if (row_pull.enabled())
+        DG_HOST_ASSERT(use_psum_layout and major_a == cute::UMMA::Major::K);
+    if (row_pull.enabled() or row_prefetch.enabled())
+        DG_HOST_ASSERT(config.launch_config.num_non_epilogue_threads == 128 and major_a == cute::UMMA::Major::K);
+
     // Compile and launch
     SM100BF16GemmRuntime::compile_and_launch("sm100_bf16_m_grouped_gemm_contiguous", {
         .gemm_desc = desc,
@@ -203,7 +216,9 @@ static void sm100_m_grouped_bf16_gemm_contiguous(const torch::Tensor& a,
         .tensor_map_a = tensor_map_a,
         .tensor_map_b = tensor_map_b,
         .tensor_map_cd = tensor_map_cd,
-        .epilogue_class = epilogue_class
+        .epilogue_class = epilogue_class,
+        .row_pull = row_pull,
+        .row_prefetch = row_prefetch
     });
 }
 

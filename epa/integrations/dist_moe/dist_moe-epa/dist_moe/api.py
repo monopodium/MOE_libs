@@ -104,6 +104,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 _MEMORY_ALIGNMENT = 128
+_EPA_DEBUG = bool(__import__('os').environ.get('DISTMOE_EPA_DEBUG'))
 _CUDA_LARGE_POOL_MIN_ALLOC_BYTES = 10 * 1024**2
 _CUDA_LARGE_POOL_BUFFER_BYTES = 20 * 1024**2
 
@@ -337,6 +338,50 @@ def _validate_block_scaled_config(config: Config) -> None:
 
 
 @dataclasses.dataclass(frozen=True)
+class EpaConfig:
+    """EPArena memory for a BF16 context (``epa`` package: pool, rounds, window).
+
+    The activation buffer becomes one EPArena pool: activation slots at the
+    bottom, and a per-call scratch frame at the top that takes whatever the
+    slots leave free. Only ``window_factor`` x balanced rows are reserved for
+    the frame, instead of ``device_scratch_capacity_factor`` x balanced rows.
+    A call whose frame holds fewer rows than it received runs its GEMMs in
+    rounds (each round a contiguous range of the expert-major receive list),
+    so any routing up to the capacity factor runs, never traps, and costs
+    extra rounds only when it does not fit.
+
+    The slots and the frame are one pool. Saved state is pushed from the
+    bottom and never enters the frame's reserve; everything above it is the
+    frame. A layer saves its full forward state (no recompute in backward)
+    whenever that still leaves the reserve free on every GPU, so pool space
+    the frame does not use this step holds checkpoints.
+
+    Before splitting a backward into rounds, the frame tries the lean layout:
+    the gathered expert input is dropped after FC13 and pulled again from the
+    GPUs that sent it (``epa.pull``) just before W13 WGRAD, so a row needs
+    ``hidden_dim`` fewer elements of frame.
+
+    Args:
+        window_factor: Rows the frame always holds, as a multiple of the
+            balanced ``max_num_local_input_tokens * top_k`` rows.
+        pool_bytes: Optional whole activation buffer per GPU (frame reserve
+            plus saved state). It replaces ``activation_slot_bytes`` and
+            ``activation_slot_capacity_factor``.
+        lean: Allow the lean backward layout (off: split into rounds at once).
+    """
+
+    window_factor: float = 2.0
+    pool_bytes: int | None = None
+    lean: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.window_factor > 0:
+            raise ValueError("EpaConfig.window_factor must be positive")
+        if self.pool_bytes is not None and self.pool_bytes <= 0:
+            raise ValueError("EpaConfig.pool_bytes must be positive")
+
+
+@dataclasses.dataclass(frozen=True)
 class Config:
     """Static execution configuration for a distributed MoE context.
 
@@ -400,6 +445,9 @@ class Config:
             inference routing, layouts, formats, and scratch-only planning.
             Per-call `torch.no_grad()` evaluation on a training context is
             supported independently and does not consume activation slots.
+        epa: EPArena pool and rounds (BF16 only). ``device_scratch_capacity_factor``
+            stays the routing guarantee; the scratch is sized by
+            ``epa.window_factor``. See :class:`EpaConfig`.
     """
 
     max_num_local_input_tokens: int
@@ -423,6 +471,7 @@ class Config:
     inference: bool = False
     situ_glu_gate_beta: float = SITU_GLU_GATE_BETA_DEFAULT
     situ_glu_up_beta: float = SITU_GLU_UP_BETA_DEFAULT
+    epa: EpaConfig | None = None
 
     def __post_init__(self) -> None:  # noqa: C901
         """Validate static execution parameters.
@@ -431,6 +480,8 @@ class Config:
             ValueError: If a numeric configuration value is invalid.
             TypeError: If non-``None`` ``wgrad_dtype`` is not BF16 or FP32.
         """
+        if self.epa is not None and (self.block_scaled is not None or self.vmm is not None):
+            raise ValueError("Config.epa supports BF16 without VMM only")
         if (
             min(
                 self.max_num_local_input_tokens,
@@ -810,40 +861,118 @@ def _resolve_cuda_device(
     return resolved
 
 
-def _epa_chunk_model_config(config: Config, ep_size: int, num_local_input_tokens: int | None = None):
-    """Return the EPArena window-sized model config, or ``None`` when disabled.
+def _epa_pull_rows(*args, **kwargs) -> None:
+    from ._epa import pull_rows
 
-    EPArena (Home + Window, ``epa/window.cuh``; Python mirror ``_epa_window``)
-    keeps ``device_scratch_capacity_factor`` as the routing guarantee but backs
-    it with a window of only ``DIST_MOE_EPA_CHUNK`` x balanced rows. The source
-    ranks' dispatch buffers are the Home; the BF16 inference forward is a
-    per-launch consumer that runs W13/SwiGLU/W2 once per round of the window,
-    so any load up to the capacity factor fits in ``Window.num_rounds()``
-    launches; rounds past the received rows are gated off on device.
+    pull_rows(*args, **kwargs)
+
+
+def _epa_window_rows(config: Config, ep_size: int) -> int:
+    """Rows the EPArena frame always holds: the scratch reserve is sized for them
+    (``_model_config`` uses ``epa.window_factor``), so it is the rounds' min window."""
+    return _model_config(config, ep_size=ep_size).max_recv_tokens
+
+
+class _EpaRounds:
+    """GEMM rounds over the expert-major receive list (EPArena ``epa.rounds``).
+
+    The planner's elastic frame holds ``frame_rows`` rows (at least the window
+    the reserve guarantees); round ``c`` runs rows ``[c*W, (c+1)*W)``.
+    Round 0 always launches. The others:
+      - under CUDA-graph capture, every round, each under an IF node on its rows;
+      - eagerly, the received rows R are copied to the host before round 0
+        is queued and read after it is launched (so the read never waits for
+        round 0) with the frame's rows W: ``ceil(R / W)`` rounds launch. In the usual case R fits and nothing more runs.
+    Without EPArena: one round over every row, no gate.
     """
-    chunk = os.environ.get("DIST_MOE_EPA_CHUNK")
-    if chunk is None or not config.inference or config.block_scaled is not None or config.vmm is not None:
-        return None
-    factor = min(float(chunk), config.device_scratch_capacity_factor, float(ep_size))
-    model_config = _model_config(config, ep_size=ep_size, num_local_input_tokens=num_local_input_tokens)
-    return dataclasses.replace(model_config, max_imbalance_factor=factor)
 
+    def __init__(self, num_rounds, plan, keep_1, counts_E, rows_1=None, min_window=1, window_1=None):
+        self.num_rounds, self.plan, self.keep_1, self.counts_E = num_rounds, plan, keep_1, counts_E
+        self.rows_all_1, self.min_window = rows_1, min_window
+        self.capturing = torch.cuda.is_current_stream_capturing()
+        self._rest = None
+        self._host_rows = None
+        if plan is not None and num_rounds > 1 and not self.capturing:
+            # queued before round 0, so waiting for it never waits for round 0
+            self._host_rows = torch.empty(2, dtype=torch.int64, pin_memory=True)
+            self._host_rows.copy_(torch.cat([rows_1.to(torch.int64), window_1]), non_blocking=True)
+            self._host_ready = torch.cuda.Event()
+            self._host_ready.record()
 
-def _epa_arena_pages() -> int:
-    """Pages of the EPArena arena backing the scratch windows (0: static window).
+    @classmethod
+    def of(cls, context, counts_E, frame_rows_1, need_recompute_1, rows_1):
+        if frame_rows_1 is None:
+            return cls(1, None, None, counts_E)
+        from ._epa import Rounds
 
-    With ``DIST_MOE_EPA_ARENA_PAGES=N`` the activation buffer holds an ``epa::Arena`` of
-    N window-sized pages (the grouped GEMMs need one contiguous scratch per round).
-    Each round takes a page on device before its first GEMM and gives it back after
-    the combine GEMM; a round without rows takes nothing.
-    """
-    return int(os.environ.get("DIST_MOE_EPA_ARENA_PAGES", "0"))
+        rounds = Rounds(
+            max_rows=context.memory_plan.total_scratch_capacity_rows,
+            min_window=_epa_window_rows(context.config, dist.get_world_size(context.group)),
+        )
+        # tensors saved in the slot (save mode) hold every row: they move with the round
+        keep_1 = torch.logical_not(need_recompute_1).to(torch.int64)
+        return cls(rounds.num_rounds, rounds.plan(counts_E, frame_rows_1), keep_1, counts_E,
+                   rows_1, rounds.min_window, frame_rows_1)
 
+    def rest(self):
+        """Rounds after round 0 to launch (call after launching round 0)."""
+        if self._rest is None:
+            if self.plan is None or self.num_rounds == 1:
+                self._rest = []
+            elif self.capturing:
+                self._rest = list(range(1, self.num_rounds))
+            else:
+                self._host_ready.synchronize()
+                rows, window = (int(v) for v in self._host_rows.tolist())
+                window = max(window, 1)
+                self._rest = list(range(1, min(self.num_rounds, -(-rows // window))))
+        return self._rest
 
-def _epa_arena_layout(window_bytes: int, num_pages: int) -> tuple[int, int]:
-    """Return (page_bytes, meta_start): pages at the buffer start, ring state after."""
-    page_bytes = -(-window_bytes // 4096) * 4096
-    return page_bytes, num_pages * page_bytes
+    def order(self):
+        yield 0
+        yield from self.rest()
+
+    @contextlib.contextmanager
+    def if_later_rounds(self):
+        """Body runs only if round 1 has rows (IF node when capturing)."""
+        if self.plan is None or self.num_rounds == 1:
+            yield False
+        elif self.capturing:
+            from ._epa import round_if
+
+            with round_if(self.plan.rows_1(1)):
+                yield True
+        else:
+            yield len(self.rest()) > 0
+
+    def counts(self, c):
+        return self.counts_E if self.plan is None else self.plan.counts[c]
+
+    def rows_1(self, c, all_rows_1):
+        return all_rows_1 if self.plan is None else self.plan.rows_1(c)
+
+    def slice(self, table, c):
+        return table if self.plan is None else self.plan.slice(table, c)
+
+    def at(self, offset_1, c, row_elements, saved):
+        """Byte offset of round c's rows (BF16); frame tensors do not move."""
+        if self.plan is None or c == 0 or not saved:
+            return offset_1
+        return offset_1 + self.plan.start[c : c + 1] * (2 * row_elements) * self.keep_1
+
+    @contextlib.contextmanager
+    def gate(self, c):
+        """Yields the kernels' run flag: None for round 0 or under an IF node."""
+        if self.plan is None or c == 0:
+            yield None
+            return
+        if not self.capturing:
+            yield self.plan.rows_1(c)
+            return
+        from ._epa import round_if
+
+        with round_if(self.plan.rows_1(c)):
+            yield None
 
 
 def _model_config(
@@ -898,7 +1027,11 @@ def _model_config(
             else num_local_input_tokens
         ),
         topk=config.top_k,
-        max_imbalance_factor=config.device_scratch_capacity_factor,
+        max_imbalance_factor=(
+            config.device_scratch_capacity_factor
+            if config.epa is None
+            else min(config.epa.window_factor, config.device_scratch_capacity_factor)
+        ),
         num_moe_layers=config.max_moe_layers_per_activation_slot,
         blockscaled_storage=block_scaled_storage,
         num_local_experts=num_local_experts,
@@ -990,14 +1123,6 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
     num_slots = 0 if config.inference else config.num_activation_slots
     if config.inference:
         device_scratch = _align_memory(model_config.min_buffer_size(0))
-        epa_chunk_config = _epa_chunk_model_config(effective_config, ep_size)
-        if epa_chunk_config is not None:
-            device_scratch = _align_memory(epa_chunk_config.min_buffer_size(0))
-            if _epa_arena_pages() > 0:
-                from ._epa_arena_torch import meta_bytes
-
-                page_bytes, meta_start = _epa_arena_layout(device_scratch, _epa_arena_pages())
-                device_scratch = _align_memory(meta_start + meta_bytes(_epa_arena_pages()))
         minimum_slot_bytes = 0
         balanced_full_save_slot_bytes = 0
     else:
@@ -1017,6 +1142,9 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
                 "balanced full-save activation state is smaller than mandatory "
                 "layer inputs"
             )
+    if config.epa is not None:
+        # alignment slack, so the frame holds the full window (epa.pool.min_window)
+        device_scratch = _align_memory(device_scratch + 2048)
     total_factor = effective_device_scratch_capacity_factor
     host_scratch = 0
     if config.vmm is not None:
@@ -1068,7 +1196,27 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
                 model_config._max_recv_tokens(total_factor), recompute=False
             )
         )
-        if config.activation_slot_bytes is not None:
+        if config.epa is not None and config.epa.pool_bytes is not None:
+            if config.activation_slot_bytes is not None or (
+                config.activation_slot_capacity_factor is not None
+            ):
+                raise ValueError(
+                    "EpaConfig.pool_bytes replaces activation_slot_bytes and "
+                    "activation_slot_capacity_factor"
+                )
+            selected_slot_bytes = (
+                (config.epa.pool_bytes - device_scratch)
+                // num_slots
+                // _MEMORY_ALIGNMENT
+                * _MEMORY_ALIGNMENT
+            )
+            if selected_slot_bytes < minimum_slot_bytes:
+                raise ValueError(
+                    f"EpaConfig.pool_bytes={config.epa.pool_bytes} is below the "
+                    f"minimum {device_scratch + num_slots * minimum_slot_bytes} bytes "
+                    "(frame reserve plus saved layer inputs)"
+                )
+        elif config.activation_slot_bytes is not None:
             if config.activation_slot_bytes < minimum_slot_bytes:
                 raise ValueError(
                     f"activation_slot_bytes={config.activation_slot_bytes} is below "
@@ -1095,7 +1243,7 @@ def plan_memory(  # noqa: C901 -- resolve one coherent activation/scratch alloca
     total_activation_bytes = num_slots * selected_slot_bytes
     total_device_buffer = total_activation_bytes + device_scratch
     balanced_rows = config.max_num_local_input_tokens * config.top_k
-    device_rows = model_config.max_recv_tokens
+    device_rows = model_config.max_recv_tokens   # EPArena: the rows the frame always holds
     total_rows = model_config._max_recv_tokens(total_factor)
     plan = MemoryPlan(
         balanced_recv_rows=balanced_rows,
@@ -1622,6 +1770,11 @@ def _create_comm_buffers(
         group=group,
         device=device,
         emulate_peer_buffers=emulate_peer_buffers,
+        dispatch_rows_per_token=(
+            None
+            if config.epa is None
+            else 1 if config.inference else config.top_k + 1
+        ),
     )
     initialize_multimem_barrier_workspace(
         group,
@@ -2098,23 +2251,10 @@ class _Bf16Autograd(torch.autograd.Function):
             ep_size=dist.get_world_size(context.group),
             num_local_input_tokens=num_local_input_tokens,
         )
-        ep_size = dist.get_world_size(context.group)
-        epa_chunk_config = (
-            None
-            if save_for_backward
-            else _epa_chunk_model_config(
-                dataclasses.replace(
-                    config,
-                    device_scratch_capacity_factor=min(
-                        config.device_scratch_capacity_factor, float(ep_size)
-                    ),
-                ),
-                ep_size,
-            )
-        )
+        epa_on = config.epa is not None
         validate_buffer_capacity(
             buffer_size=activation_buffer.buffer.numel(),
-            model_config=model_config if epa_chunk_config is None else epa_chunk_config,
+            model_config=model_config,
             num_activation_slots=(
                 0 if config.inference else activation_buffer.num_activation_slots
             ),
@@ -2122,44 +2262,8 @@ class _Bf16Autograd(torch.autograd.Function):
         num_recv_rows_per_rank_R = (
             torch.empty_like(routing.num_tokens_per_rank) if save_for_backward else None
         )
-        if epa_chunk_config is not None:
-            # EPArena window over the expert-major receive list: the plan places
-            # x_gathered/h1/h2 for one window; rounds cover the capacity factor.
-            from ._epa_window import Window as _EpaWindow
-            from ._epa_window import round_if_nonempty as _epa_round_if_nonempty
-
-            epa_window = _EpaWindow(
-                shared=epa_chunk_config.max_recv_tokens,
-                max_rows=model_config.max_recv_tokens,
-            )
-            epa_chunk_rows = epa_window.shared
-            epa_num_chunks = epa_window.num_rounds()
-            epa_counts_CE, epa_rows_C, epa_run_C = epa_window.round_counts(
-                routing.num_tokens_per_local_experts
-            )
-            epa_num_pages = _epa_arena_pages()
-            if epa_num_pages > 0:
-                from ._epa_arena_torch import ext as _epa_arena_ext
-
-                epa_arena = _epa_arena_ext()
-                epa_page_bytes, epa_meta_start = _epa_arena_layout(
-                    _align_memory(epa_chunk_config.min_buffer_size(0)), epa_num_pages
-                )
-                epa_arena_args = (
-                    activation_buffer.buffer, epa_meta_start, 0, epa_num_pages, epa_page_bytes
-                )
-                if _EPA_ARENA_READY.get(activation_buffer.buffer.data_ptr()) != epa_arena_args[1:]:
-                    epa_arena.init(*epa_arena_args)   # every page free (first call, eager)
-                    _EPA_ARENA_READY[activation_buffer.buffer.data_ptr()] = epa_arena_args[1:]
-                epa_round_off_C3 = torch.empty(
-                    epa_num_chunks, 3, dtype=torch.int64, device=epa_rows_C.device
-                )
-                epa_round_page_C = torch.empty(
-                    epa_num_chunks, dtype=torch.int32, device=epa_rows_C.device
-                )
-            num_plan_rows_1 = torch.full_like(num_recv_rows_1, epa_chunk_rows)
         forward_plan = get_forward_plan(
-            num_recv_tokens=num_recv_rows_1 if epa_chunk_config is None else num_plan_rows_1,
+            num_recv_tokens=num_recv_rows_1,
             num_recv_tokens_per_rank=routing.num_tokens_per_rank,
             buffer_status=activation_buffer,
             model_config=model_config,
@@ -2168,6 +2272,7 @@ class _Bf16Autograd(torch.autograd.Function):
             inference_mode=config.inference,
             num_recv_tokens_per_rank_snapshot=num_recv_rows_per_rank_R,
             scratch_only=scratch_only,
+            frame=epa_on,
         )
         estimated_num_recv_rows = max(1, num_local_input_tokens * context.top_k)
         fprop_config = _bf16_compute_config(
@@ -2203,57 +2308,23 @@ class _Bf16Autograd(torch.autograd.Function):
             # The outer operation owns input publication and peer barriers.
             # Actual row counts stay on-device; this estimate only selects a
             # launch configuration and never truncates the routed rows.
-            if epa_chunk_config is None:
-                windows = [(
-                    routing.num_tokens_per_local_experts,
-                    routing.fwd_gather_ptrs,
-                    routing.scatter_ptrs,
-                    num_recv_rows_1,
-                    None,
-                )]
-                epa_num_pages = 0
-            else:
-                windows = [
-                    (
-                        epa_counts_CE[c],
-                        routing.fwd_gather_ptrs[c * epa_chunk_rows : (c + 1) * epa_chunk_rows],
-                        routing.scatter_ptrs[c * epa_chunk_rows : (c + 1) * epa_chunk_rows],
-                        epa_rows_C[c : c + 1],
-                        # windows past the received rows exit after kernel setup
-                        None if c == 0 else epa_run_C[c : c + 1],
-                    )
-                    for c in range(epa_num_chunks)
-                ]
-            epa_round_seen: list[int] = []
-            for window_counts_E, window_gather_ptrs, window_scatter_ptrs, window_rows_1, window_run_1 in windows:
-                # rounds past the first: a CUDA-graph IF node when capturing, else an
-                # in-kernel gate (window_run_1)
-                with (
-                    contextlib.nullcontext(False)
-                    if window_run_1 is None
-                    else _epa_round_if_nonempty(window_rows_1)
-                ) as graph_gated:
-                    r_xg, r_h1, r_h2 = (
-                        forward_plan.x_gathered_offset,
-                        forward_plan.h1_offset,
-                        forward_plan.h2_offset,
-                    )
-                    if epa_num_pages > 0:
-                        # this round's scratch: a page taken from the arena on device
-                        c = len(epa_round_seen)
-                        epa_round_seen.append(c)
-                        epa_arena.round_take(
-                            *epa_arena_args, window_rows_1, r_xg, r_h1, r_h2,
-                            epa_round_off_C3[c], epa_round_page_C[c : c + 1],
-                        )
-                        r_xg = epa_round_off_C3[c, 0:1]
-                        r_h1 = epa_round_off_C3[c, 1:2]
-                        r_h2 = epa_round_off_C3[c, 2:3]
+            # EPArena: the frame holds forward_plan.frame_rows rows; round c runs
+            # rows [c*W, (c+1)*W) of the expert-major receive list. Saved tensors
+            # (save mode) hold every row, so their round offset moves with c;
+            # frame tensors are the same for every round.
+            rounds = _EpaRounds.of(context, routing.num_tokens_per_local_experts,
+                                   forward_plan.frame_rows if epa_on else None,
+                                   forward_plan.need_recompute, num_recv_rows_1)
+            for c in rounds.order():
+                with rounds.gate(c) as run_1:
+                    r_xg = rounds.at(forward_plan.x_gathered_offset, c, context.hidden_dim, saved=True)
+                    r_h1 = rounds.at(forward_plan.h1_offset, c, 2 * w2_EDF.shape[2], saved=True)
+                    r_h2 = forward_plan.h2_offset
                     dist_grouped_gemm_fprop_dispatch(
                         x=x_TD,
                         w=w13_EFD,
-                        num_tokens_per_local_expert=window_counts_E,
-                        gather_ptrs=window_gather_ptrs,
+                        num_tokens_per_local_expert=rounds.counts(c),
+                        gather_ptrs=rounds.slice(routing.fwd_gather_ptrs, c),
                         num_out_tokens=None,
                         symm_mem_buffer=buffers.dispatch,
                         topk=context.top_k,
@@ -2263,7 +2334,7 @@ class _Bf16Autograd(torch.autograd.Function):
                         x_gathered=r_xg,
                         config=fprop_config,
                         estimate_recv_num_tokens=estimated_num_recv_rows,
-                        conditional_execution=None if graph_gated else window_run_1,
+                        conditional_execution=run_1,
                         swiglu_h2=r_h2 if fused_swiglu_forward else None,
                         swiglu_clamped=config.activation == "swiglu_clamped",
                         swiglu_alpha=config.swiglu_alpha,
@@ -2283,7 +2354,7 @@ class _Bf16Autograd(torch.autograd.Function):
                             situ_glu_gate_beta=config.situ_glu_gate_beta,
                             situ_glu_up_beta=config.situ_glu_up_beta,
                             activation_buffer=activation_buffer.buffer,
-                            num_recv_tokens=window_rows_1,
+                            num_recv_tokens=rounds.rows_1(c, num_recv_rows_1),
                             feature_dim=w2_EDF.shape[2],
                             dtype=w2_EDF.dtype,
                             clip_stats_out=options.swiglu_clip_stats_out_3,
@@ -2292,17 +2363,15 @@ class _Bf16Autograd(torch.autograd.Function):
                     h3_MD = dist_grouped_gemm_fprop_combine(
                         x=r_h2,
                         w=w2_EDF,
-                        num_tokens_per_local_expert=window_counts_E,
-                        scatter_ptrs=window_scatter_ptrs,
+                        num_tokens_per_local_expert=rounds.counts(c),
+                        scatter_ptrs=rounds.slice(routing.scatter_ptrs, c),
                         symm_mem_buffer=buffers.combine,
                         num_sms=config.num_sms,
                         activation_buffer=activation_buffer.buffer,
                         config=combine_config,
                         estimate_recv_num_tokens=estimated_num_recv_rows,
-                        conditional_execution=None if graph_gated else window_run_1,
+                        conditional_execution=run_1,
                     )
-                    if epa_num_pages > 0:
-                        epa_arena.round_give(*epa_arena_args, epa_round_page_C[c : c + 1])
             h3_MD = h3_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
             ]
@@ -2498,13 +2567,23 @@ class _Bf16Autograd(torch.autograd.Function):
             h3_offset=h3_offset,
             activation_slot_id_1=activation_slot_id_1,
         )
+        epa_on = config.epa is not None
         backward_plan = get_backward_plan(
             num_recv_tokens=num_recv_rows_1,
             num_recv_tokens_per_rank=num_recv_rows_per_rank_R,
             forward_plan=forward_plan,
             buffer_status=activation_buffer,
             model_config=ctx.model_config,
+            frame=epa_on,
+            lean=epa_on and config.epa.lean,
         )
+        if epa_on and _EPA_DEBUG and not torch.cuda.is_current_stream_capturing():
+            print(
+                f"[epa bwd rank {dist.get_rank(context.group)}] rows={num_recv_rows_1.item()} "
+                f"recompute={int(need_recompute.item())} lean={backward_plan.lean.item()} "
+                f"frame_rows={backward_plan.frame_rows.item()}",
+                flush=True,
+            )
         estimated_num_recv_rows = max(1, num_local_input_tokens * context.top_k)
         fprop_config = _bf16_compute_config(
             config, routed_rows=estimated_num_recv_rows, num_groups=w13_EFD.shape[0]
@@ -2522,43 +2601,53 @@ class _Bf16Autograd(torch.autograd.Function):
             num_groups=w13_EFD.shape[0],
         )
         assert fprop_config is not None and wgrad_config is not None
-
-        # 3. Recompute H1/H3 only when needed. H2 is always transient scratch,
-        # so its activation kernel runs even when H1 was saved.
-        _initialize_fake_peer_scatter_output(buffers.combine)
-        with record_function("dist_moe_recompute"):
+        rounds = _EpaRounds.of(
+            context,
+            num_recv_rows_per_local_expert_E,
+            backward_plan.frame_rows if epa_on else None,
+            need_recompute,
+            num_recv_rows_1,
+        )
+        feature_dim = w2_EDF.shape[2]
+        if epa_on:
+            # EPArena: recompute pulls x from its own dispatch region past the
+            # [T, K, D] gradient routes, so peers may already push gradient
+            # routes of one round while a later round still pulls x.
+            routes = config.max_num_local_input_tokens * context.top_k
+            dispatch_local_TD = buffers.dispatch.local().view(-1, context.hidden_dim)[
+                routes : routes + num_local_input_tokens
+            ]
+            recompute_gather_ptrs_M = dispatch_fwd_gather_ptrs_M + routes * context.hidden_dim * 2
+        else:
             dispatch_local_TD = buffers.dispatch.hdl.get_buffer(
                 buffers.dispatch.hdl.rank,
                 (num_local_input_tokens, context.hidden_dim),
                 torch.bfloat16,
             )
-            copy_activation_to_dispatch(
-                dispatch=dispatch_local_TD,
-                activation_buffer=activation_buffer.buffer,
-                activation_offset=x_offset,
-                condition=need_recompute,
-            )
-            _ep_barrier(buffers.dispatch, conditional_execution=need_recompute)
+            recompute_gather_ptrs_M = dispatch_fwd_gather_ptrs_M
+
+        def recompute_input(c, run_1):
+            """FC13 + SwiGLU of round c: x_gathered and H1 (if recomputing), H2 always."""
+            cond = need_recompute if run_1 is None else run_1 * need_recompute.to(torch.int32)
             dist_grouped_gemm_fprop_dispatch(
                 x=x_offset,
                 w=w13_EFD,
-                num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                gather_ptrs=dispatch_fwd_gather_ptrs_M,
+                num_tokens_per_local_expert=rounds.counts(c),
+                gather_ptrs=rounds.slice(recompute_gather_ptrs_M, c),
                 num_out_tokens=None,
                 symm_mem_buffer=buffers.dispatch,
                 topk=context.top_k,
                 num_sms=config.num_sms,
                 activation_buffer=activation_buffer.buffer,
-                y=backward_plan.h1_offset,
-                x_gathered=backward_plan.x_gathered_offset,
-                conditional_execution=need_recompute,
+                y=rounds.at(backward_plan.h1_offset, c, 2 * feature_dim, saved=True),
+                x_gathered=rounds.at(backward_plan.x_gathered_offset, c, context.hidden_dim, saved=True),
+                conditional_execution=cond,
                 config=fprop_config,
                 estimate_recv_num_tokens=estimated_num_recv_rows,
             )
-            # H2 is always transient scratch, even when H1 was saved. Rebuild
-            # it unconditionally before W2 WGRAD, matching the internal order.
+            # H2 is always transient scratch, even when H1 was saved.
             swiglu_fwd(
-                x=backward_plan.h1_offset,
+                x=rounds.at(backward_plan.h1_offset, c, 2 * feature_dim, saved=True),
                 z=backward_plan.h2_offset,
                 clamped=config.activation == "swiglu_clamped",
                 alpha=config.swiglu_alpha,
@@ -2567,22 +2656,48 @@ class _Bf16Autograd(torch.autograd.Function):
                 situ_glu_gate_beta=config.situ_glu_gate_beta,
                 situ_glu_up_beta=config.situ_glu_up_beta,
                 activation_buffer=activation_buffer.buffer,
-                num_recv_tokens=num_recv_rows_1,
-                feature_dim=w2_EDF.shape[2],
+                num_recv_tokens=rounds.rows_1(c, num_recv_rows_1),
+                feature_dim=feature_dim,
                 dtype=w2_EDF.dtype,
+                conditional_execution=run_1,
             )
-            h3_saved_MD = dist_grouped_gemm_fprop_combine(
+
+        def recompute_output(c, run_1):
+            """FC2 of round c: route outputs H3 into the owners' combine buffers."""
+            cond = need_recompute if run_1 is None else run_1 * need_recompute.to(torch.int32)
+            return dist_grouped_gemm_fprop_combine(
                 x=backward_plan.h2_offset,
                 w=w2_EDF,
-                num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                scatter_ptrs=combine_scatter_ptrs_M,
+                num_tokens_per_local_expert=rounds.counts(c),
+                scatter_ptrs=rounds.slice(combine_scatter_ptrs_M, c),
                 symm_mem_buffer=buffers.combine,
                 num_sms=config.num_sms,
                 activation_buffer=activation_buffer.buffer,
-                conditional_execution=need_recompute,
+                conditional_execution=cond,
                 config=combine_config,
                 estimate_recv_num_tokens=estimated_num_recv_rows,
             )
+
+        # 3. Recompute H1/H3 only when needed. H2 is always transient scratch,
+        # so its activation kernel runs even when H1 was saved. With rounds,
+        # each round rebuilds its inputs in the frame before its gradients.
+        _initialize_fake_peer_scatter_output(buffers.combine)
+        with record_function("dist_moe_recompute"):
+            copy_activation_to_dispatch(
+                dispatch=dispatch_local_TD,
+                activation_buffer=activation_buffer.buffer,
+                activation_offset=x_offset,
+                condition=need_recompute,
+            )
+            _ep_barrier(buffers.dispatch, conditional_execution=need_recompute)
+            recompute_input(0, None)
+            h3_saved_MD = recompute_output(0, None)
+            # later rounds reuse the frame; round 0's inputs are rebuilt below
+            for c in rounds.rest():
+                with rounds.gate(c) as run_1:
+                    recompute = need_recompute.to(torch.int32)
+                    recompute_input(c, recompute if run_1 is None else run_1 * recompute)
+                    recompute_output(c, run_1)
             h3_saved_MD = h3_saved_MD.view(-1, context.hidden_dim)[
                 : num_local_input_tokens * context.top_k
             ]
@@ -2625,23 +2740,10 @@ class _Bf16Autograd(torch.autograd.Function):
             ).copy_(grad_h3_MD)
         _ep_barrier(buffers.combine)
 
-        # 5. Compute W2 then W13 gradients in dependency order. Optional
-        # destinations let the kernels write directly into framework storage.
+        # 5. Compute W2 then W13 gradients in dependency order, one round at a
+        # time (round 0 only without EPArena). Optional destinations let the
+        # kernels write directly into framework storage; later rounds add.
         with record_function("dist_moe_backward"):
-            dist_grouped_gemm_dgrad_dispatch(
-                dy=grad_h3_MD,
-                w=w2_EDF,
-                num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                gather_ptrs=combine_scatter_ptrs_M,
-                num_out_tokens=None,
-                symm_mem_buffer=buffers.combine,
-                num_sms=config.num_sms,
-                activation_buffer=activation_buffer.buffer,
-                dx=backward_plan.grad_h2_offset,
-                dy_gathered=backward_plan.grad_h3_gathered_offset,
-                config=fprop_config,
-            )
-
             if wgrad_destinations is None:
                 grad_w2_output_EDF = torch.empty(
                     w2_EDF.shape,
@@ -2658,77 +2760,6 @@ class _Bf16Autograd(torch.autograd.Function):
                         device=w2_EDF.device,
                     )
                 w2_output_accum = wgrad_destinations[1].accumulate
-            grad_w2_EDF = grouped_gemm_wgrad(
-                dy=backward_plan.grad_h3_gathered_offset,
-                x=backward_plan.h2_offset,
-                split_sizes=num_recv_rows_per_local_expert_E,
-                activation_buffer=activation_buffer.buffer,
-                hidden_dim_dy=w2_EDF.shape[1],
-                hidden_dim_x=w2_EDF.shape[2],
-                dtype=w2_EDF.dtype,
-                output_accum=w2_output_accum,
-                wgrad=grad_w2_output_EDF,
-                num_sms=config.num_sms,
-                config=wgrad_config,
-            )
-            grad_w2_EDF = _postprocess_wgrad(
-                options.wgrad_postprocess_fn,
-                "w2",
-                grad_w2_EDF,
-            )
-            _initialize_fake_peer_scatter_output(buffers.dispatch)
-            # W2 WGRAD has consumed H2 before its scratch may be reused for
-            # grad_H1. Fusion writes grad_H1 into that same planned destination.
-            if (
-                config.activation in ("swiglu", "swiglu_clamped")
-                and w2_EDF.shape[2] % native_swiglu_bwd_col_multiple() == 0
-            ):
-                grad_x_TKD, _ = dist_grouped_gemm_dgrad_swiglu_bwd_combine(
-                    grad_h2=backward_plan.grad_h2_offset,
-                    h1=backward_plan.h1_offset,
-                    w=w13_EFD,
-                    num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                    scatter_ptrs=dispatch_bwd_gather_ptrs_M,
-                    symm_mem_buffer=buffers.dispatch,
-                    grad_h1=backward_plan.grad_h1_offset,
-                    num_sms=config.num_sms,
-                    activation_buffer=activation_buffer.buffer,
-                    config=fprop_config,
-                    estimate_recv_num_tokens=estimated_num_recv_rows,
-                    swiglu_clamped=config.activation == "swiglu_clamped",
-                    swiglu_alpha=config.swiglu_alpha,
-                    swiglu_limit=config.swiglu_limit,
-                )
-            else:
-                swiglu_bwd(
-                    dz=backward_plan.grad_h2_offset,
-                    x=backward_plan.h1_offset,
-                    dxy=backward_plan.grad_h1_offset,
-                    clamped=config.activation == "swiglu_clamped",
-                    alpha=config.swiglu_alpha,
-                    limit=config.swiglu_limit,
-                    situ_glu=config.activation == "situ_glu",
-                    situ_glu_gate_beta=config.situ_glu_gate_beta,
-                    situ_glu_up_beta=config.situ_glu_up_beta,
-                    activation_buffer=activation_buffer.buffer,
-                    num_recv_tokens=num_recv_rows_1,
-                    feature_dim=w2_EDF.shape[2],
-                    dtype=w2_EDF.dtype,
-                )
-                grad_x_TKD = dist_grouped_gemm_dgrad_combine(
-                    dy=backward_plan.grad_h1_offset,
-                    w=w13_EFD,
-                    num_tokens_per_local_expert=num_recv_rows_per_local_expert_E,
-                    scatter_ptrs=dispatch_bwd_gather_ptrs_M,
-                    symm_mem_buffer=buffers.dispatch,
-                    num_sms=config.num_sms,
-                    activation_buffer=activation_buffer.buffer,
-                    config=fprop_config,
-                )
-            grad_x_TKD = grad_x_TKD.view(-1, context.hidden_dim)[
-                : num_local_input_tokens * context.top_k
-            ].view(num_local_input_tokens, context.top_k, context.hidden_dim)
-
             if wgrad_destinations is None:
                 grad_w13_output_EFD = torch.empty(
                     w13_EFD.shape,
@@ -2745,19 +2776,152 @@ class _Bf16Autograd(torch.autograd.Function):
                         device=w13_EFD.device,
                     )
                 w13_output_accum = wgrad_destinations[0].accumulate
-            grad_w13_EFD = grouped_gemm_wgrad(
-                dy=backward_plan.grad_h1_offset,
-                x=backward_plan.x_gathered_offset,
-                split_sizes=num_recv_rows_per_local_expert_E,
-                activation_buffer=activation_buffer.buffer,
-                hidden_dim_dy=w13_EFD.shape[1],
-                hidden_dim_x=w13_EFD.shape[2],
-                dtype=w13_EFD.dtype,
-                output_accum=w13_output_accum,
-                wgrad=grad_w13_output_EFD,
-                num_sms=config.num_sms,
-                config=wgrad_config,
+            _initialize_fake_peer_scatter_output(buffers.dispatch)
+            fused_swiglu_backward = (
+                config.activation in ("swiglu", "swiglu_clamped")
+                and feature_dim % native_swiglu_bwd_col_multiple() == 0
             )
+            for c in rounds.order():
+                with rounds.gate(c) as run_1:
+                    if c > 0:
+                        recompute_input(c, run_1)
+                    else:
+                        with rounds.if_later_rounds() as later:
+                            if later:   # they overwrote round 0's frame
+                                recompute_input(0, None)
+                    counts_E = rounds.counts(c)
+                    h1_c = rounds.at(backward_plan.h1_offset, c, 2 * feature_dim, saved=True)
+                    x_gathered_c = rounds.at(
+                        backward_plan.x_gathered_offset, c, context.hidden_dim, saved=True
+                    )
+                    dist_grouped_gemm_dgrad_dispatch(
+                        dy=grad_h3_MD,
+                        w=w2_EDF,
+                        num_tokens_per_local_expert=counts_E,
+                        gather_ptrs=rounds.slice(combine_scatter_ptrs_M, c),
+                        num_out_tokens=None,
+                        symm_mem_buffer=buffers.combine,
+                        num_sms=config.num_sms,
+                        activation_buffer=activation_buffer.buffer,
+                        dx=backward_plan.grad_h2_offset,
+                        dy_gathered=backward_plan.grad_h3_gathered_offset,
+                        config=fprop_config,
+                        conditional_execution=run_1,
+                    )
+                    grad_w2_EDF = grouped_gemm_wgrad(
+                        dy=backward_plan.grad_h3_gathered_offset,
+                        x=backward_plan.h2_offset,
+                        split_sizes=counts_E,
+                        activation_buffer=activation_buffer.buffer,
+                        hidden_dim_dy=w2_EDF.shape[1],
+                        hidden_dim_x=feature_dim,
+                        dtype=w2_EDF.dtype,
+                        output_accum=w2_output_accum or c > 0,
+                        wgrad=grad_w2_output_EDF,
+                        num_sms=config.num_sms,
+                        config=wgrad_config,
+                        conditional_execution=run_1,
+                    )
+                    if epa_on:
+                        # lean layout: x_gathered shared grad_h3_gathered's rows, which
+                        # W2 WGRAD has just consumed; pull it again from the x regions
+                        lean_1 = backward_plan.lean if run_1 is None else backward_plan.lean * run_1
+                        _epa_pull_rows(
+                            activation_buffer.buffer,
+                            x_gathered_c,
+                            rounds.slice(recompute_gather_ptrs_M, c),
+                            rounds.rows_1(c, num_recv_rows_1),
+                            context.hidden_dim * 2,
+                            run_1=lean_1,
+                            num_programs=config.num_sms,
+                        )
+                    if rounds.num_rounds == 1:   # upstream order: W2 done before W13 starts
+                        grad_w2_EDF = _postprocess_wgrad(
+                            options.wgrad_postprocess_fn,
+                            "w2",
+                            grad_w2_EDF,
+                        )
+                    # W2 WGRAD has consumed H2 before its scratch may be reused for
+                    # grad_H1. Fusion writes grad_H1 into that same planned destination.
+                    if fused_swiglu_backward:
+                        grad_x_TKD, _ = dist_grouped_gemm_dgrad_swiglu_bwd_combine(
+                            grad_h2=backward_plan.grad_h2_offset,
+                            h1=h1_c,
+                            w=w13_EFD,
+                            num_tokens_per_local_expert=counts_E,
+                            scatter_ptrs=rounds.slice(dispatch_bwd_gather_ptrs_M, c),
+                            symm_mem_buffer=buffers.dispatch,
+                            grad_h1=backward_plan.grad_h1_offset,
+                            num_sms=config.num_sms,
+                            activation_buffer=activation_buffer.buffer,
+                            config=fprop_config,
+                            estimate_recv_num_tokens=estimated_num_recv_rows,
+                            swiglu_clamped=config.activation == "swiglu_clamped",
+                            swiglu_alpha=config.swiglu_alpha,
+                            swiglu_limit=config.swiglu_limit,
+                            conditional_execution=run_1,
+                        )
+                    else:
+                        swiglu_bwd(
+                            dz=backward_plan.grad_h2_offset,
+                            x=h1_c,
+                            dxy=backward_plan.grad_h1_offset,
+                            clamped=config.activation == "swiglu_clamped",
+                            alpha=config.swiglu_alpha,
+                            limit=config.swiglu_limit,
+                            situ_glu=config.activation == "situ_glu",
+                            situ_glu_gate_beta=config.situ_glu_gate_beta,
+                            situ_glu_up_beta=config.situ_glu_up_beta,
+                            activation_buffer=activation_buffer.buffer,
+                            num_recv_tokens=rounds.rows_1(c, num_recv_rows_1),
+                            feature_dim=feature_dim,
+                            dtype=w2_EDF.dtype,
+                        )
+                        grad_x_TKD = dist_grouped_gemm_dgrad_combine(
+                            dy=backward_plan.grad_h1_offset,
+                            w=w13_EFD,
+                            num_tokens_per_local_expert=counts_E,
+                            scatter_ptrs=rounds.slice(dispatch_bwd_gather_ptrs_M, c),
+                            symm_mem_buffer=buffers.dispatch,
+                            num_sms=config.num_sms,
+                            activation_buffer=activation_buffer.buffer,
+                            config=fprop_config,
+                            conditional_execution=run_1,
+                        )
+                    grad_w13_EFD = grouped_gemm_wgrad(
+                        dy=backward_plan.grad_h1_offset,
+                        x=x_gathered_c,
+                        split_sizes=counts_E,
+                        activation_buffer=activation_buffer.buffer,
+                        hidden_dim_dy=w13_EFD.shape[1],
+                        hidden_dim_x=w13_EFD.shape[2],
+                        dtype=w13_EFD.dtype,
+                        output_accum=w13_output_accum or c > 0,
+                        wgrad=grad_w13_output_EFD,
+                        num_sms=config.num_sms,
+                        config=wgrad_config,
+                        conditional_execution=run_1,
+                    )
+                if c == 0:
+                    grad_w2_round0_EDF, grad_x_round0_TKD, grad_w13_round0_EFD = (
+                        grad_w2_EDF,
+                        grad_x_TKD,
+                        grad_w13_EFD,
+                    )
+            grad_w2_EDF, grad_x_TKD, grad_w13_EFD = (
+                grad_w2_round0_EDF,
+                grad_x_round0_TKD,
+                grad_w13_round0_EFD,
+            )
+            if rounds.num_rounds > 1:   # final only after every round
+                grad_w2_EDF = _postprocess_wgrad(
+                    options.wgrad_postprocess_fn,
+                    "w2",
+                    grad_w2_EDF,
+                )
+            grad_x_TKD = grad_x_TKD.view(-1, context.hidden_dim)[
+                : num_local_input_tokens * context.top_k
+            ].view(num_local_input_tokens, context.top_k, context.hidden_dim)
             grad_w13_EFD = _postprocess_wgrad(
                 options.wgrad_postprocess_fn,
                 "w13",
@@ -2804,9 +2968,6 @@ class _Bf16Autograd(torch.autograd.Function):
 
 # Keep context-owned mutable storage explicit so tracing and CUDA graphs retain
 # the operation's ordering and lifetime dependencies.
-# activation buffers whose EPArena arena is initialized: data_ptr -> layout
-_EPA_ARENA_READY: dict[int, tuple] = {}
-
 _LIBRARY = torch.library.Library("dist_moe", "DEF")
 _LIBRARY.define(
     "bf16(Tensor x_TD, Tensor topk_expert_ids_TK, Tensor topk_scores_TK, Tensor w13_EFD, Tensor w2_EDF, "

@@ -580,6 +580,7 @@ class _CommunicationBuffers:
         group: dist.ProcessGroup,
         device: torch.device,
         emulate_peer_buffers: bool | None = None,
+        dispatch_rows_per_token: int | None = None,
     ) -> _CommunicationBuffers:
         """Create all communication buffers required by distributed MoE.
 
@@ -594,6 +595,10 @@ class _CommunicationBuffers:
                 buffers. This validates shapes and memory without simulating
                 distributed communication or numerics. ``None`` detects
                 PyTorch's built-in FakePG.
+            dispatch_rows_per_token: Dispatch rows per input token (default
+                ``top_k``). EPArena uses 1 for BF16 inference (only x is
+                published) and ``top_k + 1`` for training (x gets its own
+                region past the ``[T, K, D]`` gradient routes).
 
         Returns:
             Routing, dispatch, and combine symmetric-memory buffers.
@@ -613,7 +618,11 @@ class _CommunicationBuffers:
         return cls._from_buffers(
             routing=routing,
             dispatch=SymmetricMemoryBuffer.create(
-                (max_num_local_input_tokens, top_k, hidden_dim),
+                (
+                    max_num_local_input_tokens,
+                    top_k if dispatch_rows_per_token is None else dispatch_rows_per_token,
+                    hidden_dim,
+                ),
                 torch.bfloat16,
                 group,
                 device,

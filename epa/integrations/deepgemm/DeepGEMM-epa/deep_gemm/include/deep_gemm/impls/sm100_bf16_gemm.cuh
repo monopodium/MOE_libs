@@ -17,6 +17,8 @@
 #include <deep_gemm/ptx/tcgen05.cuh>
 #include <deep_gemm/ptx/utils.cuh>
 
+#include <epa/row_pull.cuh>
+
 namespace deep_gemm {
 
 template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
@@ -32,14 +34,17 @@ template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
           bool kSwapAB, bool kEnsureZeroPadding,
           GemmType kGemmType, bool kWithAccumulation,
           typename cd_dtype_t, typename epilogue_operator_t,
-          uint64_t kTensorCoreUtilControl>
+          uint64_t kTensorCoreUtilControl,
+          bool kWithRowPull = false>
 CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
 sm100_bf16_gemm_impl(int* grouped_layout,
                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
                      const __grid_constant__ EpilogueOperatorArgs epilogue_args,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_a,
                      const __grid_constant__ cute::TmaDescriptor tensor_map_b,
-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
+                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd,
+                     const __grid_constant__ epa::RowPull row_pull,
+                     const __grid_constant__ epa::RowPull row_prefetch) {
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     // Enlarge `BLOCK_K` for some cases
     // NOTES: this is for reducing the `umma_arrive()` overhead
@@ -144,6 +149,11 @@ sm100_bf16_gemm_impl(int* grouped_layout,
         // Allocate tensor memory
         Allocator().allocate(kNumTmemCols, &smem.tmem_ptr);
     }
+    // EPArena row pull: tiles confirmed by the waiter warp (warp 3) for the A-loading thread
+    __shared__ int pull_tiles_ready;
+    if (kWithRowPull and threadIdx.x == 0)
+        pull_tiles_ready = 0;
+
     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
 
     // Wait for primary kernel completion
@@ -155,6 +165,19 @@ sm100_bf16_gemm_impl(int* grouped_layout,
     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kKAlignment>(
         shape_m, shape_n, shape_k, grouped_layout);
     epilogue_operator_t epilogue_operator(epilogue_args);
+
+    // EPArena row pull (epa/row_pull.cuh), with `kWithRowPull` only. The spare warps 2-3:
+    //   `row_pull`      A is a local stage, filled from an EPArena segment (rows may sit on other
+    //                   GPUs); the blocks that read a tile share its rows (warp 2 copies, never
+    //                   waits), warp 3 waits for each tile and hands it to the A-loading thread
+    //                   through shared memory
+    //   `row_prefetch`  another stage, for a later launch on this stream: filled whole, spread over
+    //                   all blocks, after this launch's own pulls; nobody here waits for it
+    constexpr int kNumPullWarps = 2;
+    DG_STATIC_ASSERT(not kWithRowPull or (kNumNonEpilogueThreads == 128 and kMajorA == cute::UMMA::Major::K), "Invalid row pull");
+    const bool with_pull = kWithRowPull and row_pull.enabled();
+    DG_TRAP_ONLY_DEVICE_ASSERT(not with_pull or kGemmType == GemmType::MGroupedContiguousWithPsumLayout);
+    const auto pull_token = with_pull ? row_pull.token() : 0ull;
 
     // Pipeline and TMA phases
     uint32_t stage_idx = 0, phase = 0, tensor_core_phase = 0;
@@ -176,6 +199,11 @@ sm100_bf16_gemm_impl(int* grouped_layout,
 
             // For k-grouped layout, the number of block K is variable
             const auto num_total_k_blocks = cute::max(1u, math::ceil_div(scheduler.current_shape_k, BLOCK_K));
+
+            // The tile's rows must be in the stage before its first A load
+            if (with_pull)
+                epa::RowPull::wait_ready(&pull_tiles_ready, static_cast<int>(scheduler.current_iter) + 1);
+
             for (uint32_t k_block_idx = 0; k_block_idx < num_total_k_blocks; advance_pipeline(k_block_idx)) {
                 // Wait consumer release
                 smem.empty_barriers[stage_idx].wait(phase ^ 1);
@@ -348,6 +376,28 @@ sm100_bf16_gemm_impl(int* grouped_layout,
             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
             smem.tmem_empty_barriers[iter_idx % kNumEpilogueStages].wait(accum_phase_idx);
         }
+    } else if (kWithRowPull and (warp_idx == 2 or warp_idx == 3)) {
+        // EPArena row pull: this block's share of every tile it is given, then the prefetch (never waits)
+        const auto pull_warp = static_cast<int>(warp_idx - 2);
+        if (with_pull and pull_warp == 0) {
+            // Copier: this block's share of every tile it is given
+            while (scheduler.get_next_block(m_block_idx, n_block_idx))
+                row_pull.pull_rows(static_cast<int>(m_block_idx * BLOCK_M), static_cast<int>((m_block_idx + 1) * BLOCK_M),
+                                   static_cast<int>(n_block_idx), static_cast<int>(scheduler.num_n_blocks),
+                                   static_cast<int>(lane_idx), pull_token);
+        } else if (with_pull) {
+            // Waiter: confirm each tile in load order, then hand it to the A-loading thread
+            while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
+                if (lane_idx == 0) {
+                    row_pull.wait_rows(static_cast<int>(m_block_idx * BLOCK_M), static_cast<int>((m_block_idx + 1) * BLOCK_M), pull_token);
+                    epa::RowPull::signal_ready(&pull_tiles_ready, static_cast<int>(scheduler.current_iter) + 1);
+                }
+                __syncwarp();
+            }
+        }
+        if (row_prefetch.enabled())
+            row_prefetch.prefetch(static_cast<int>(blockIdx.x) * kNumPullWarps + pull_warp, static_cast<int>(gridDim.x) * kNumPullWarps,
+                                  static_cast<int>(lane_idx), row_prefetch.token());
     } else if (epilogue_warp_idx < kNumUMMAStoreThreads / 32) {
         // Epilogue warp groups
         epilogue_operator.init(scheduler.num_blocks * kNumGroups, epilogue_warp_idx * 32 + lane_idx);

@@ -778,7 +778,8 @@ class EPBuffer(BufferBase):
                 previous_event: EventHandle = None,
                 async_with_compute_stream: bool = False,
                 allocate_on_comm_stream: bool = False,
-                defer_epilogue: bool = False) \
+                defer_epilogue: bool = False,
+                out: Optional[torch.Tensor] = None) \
             -> Union[Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap], EventOverlap]:
         """
         Combine (reduce) tokens from different ranks back to their original ranks.
@@ -800,6 +801,8 @@ class EPBuffer(BufferBase):
             allocate_on_comm_stream: control whether all the allocated tensors' ownership to be on the
                 communication stream.
             defer_epilogue: whether to defer the reduce epilogue until `event.current_stream_wait()` is called.
+            out: optional `[num_combined_tokens, hidden]` contiguous `torch.bfloat16` tensor to write the result
+                into instead of a new allocation (e.g. a buffer whose contents are dead by then).
                 This requires `async_with_compute_stream=True`.
 
         Returns:
@@ -834,7 +837,7 @@ class EPBuffer(BufferBase):
                                                                 async_with_compute_stream,
                                                                 allocate_on_comm_stream,
                                                                 handle.do_expand,
-                                                                defer_epilogue)
+                                                                defer_epilogue, out)
         event_overlap = EventOverlap(event)
         if deferred_epilogue is not None:
             event_overlap.register_hook_after_wait(deferred_epilogue)

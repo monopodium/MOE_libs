@@ -16,6 +16,8 @@ dataclasses and the launch wrappers live in ``activation_buffer_planner.py``.
 import triton
 import triton.language as tl
 
+from ._epa.pool import frame_rows as _epa_frame_rows
+
 from .kernels.activation_buffer import (
     ACTIVATION_A_Q_OFFSET,
     ACTIVATION_A_SCALE_OFFSET,
@@ -1092,6 +1094,8 @@ def _triton_get_forward_plan(
     moe_layer_id_ptr,  # [N] int64 - IN-PLACE updated
     num_moe_layers: tl.constexpr,
     scratch_only: tl.constexpr,
+    frame_rows_ptr,  # optional [1] int64 output (EPArena elastic frame)
+    FRAME: tl.constexpr,
 ):
     """Triton kernel to compute forward plan without D2H transfers.
 
@@ -1222,6 +1226,31 @@ def _triton_get_forward_plan(
             # x not saved in no-recompute mode, set to 0 (unused)
             x_offset = tl.zeros([], dtype=tl.int64)
 
+    if FRAME:
+        # EPArena elastic frame: the scratch tensors hold only the rows that fit
+        # between the top of the last activation slot and the scratch end; the
+        # caller runs ceil(rows / frame_rows) rounds over them. Slot tensors
+        # (save mode) still hold every received row.
+        if num_activation_slots == 0:
+            frame_floor = tl.zeros([], dtype=tl.int64)
+        else:
+            frame_floor = tl.load(buffer_offsets_ptr + (num_activation_slots - 1))
+            if not scratch_only:
+                frame_floor = tl.where(
+                    microbatch_id == num_activation_slots - 1, new_free_start, frame_floor
+                )
+        frame_hd = tl.cast(hidden_dim * element_size, tl.int64)
+        frame_fd = tl.cast(intermediate_dim * element_size, tl.int64)
+        frame_row = tl.where(need_recompute, frame_hd + 3 * frame_fd, frame_fd)
+        frame_rows = _epa_frame_rows(scratch_end, frame_floor, frame_row, num_recv_tokens, 3)
+        f_h2 = _tl_align(frame_rows * frame_fd)
+        f_h1 = _tl_align(frame_rows * 2 * frame_fd)
+        f_xg = _tl_align(frame_rows * frame_hd)
+        h2_offset = scratch_end - f_h2
+        if need_recompute:
+            h1_offset = h2_offset - f_h1
+            x_gathered_offset = h1_offset - f_xg
+        tl.store(frame_rows_ptr, frame_rows)
     tl.store(need_recompute_ptr, need_recompute)
     tl.store(fwd_offsets_ptr, x_offset)
     tl.store(fwd_offsets_ptr + 1, x_gathered_offset)
@@ -1233,6 +1262,9 @@ def _triton_get_forward_plan(
     scratch_bottom = tl.where(need_recompute, x_gathered_offset, h2_offset)
     # Also 0 for an inference-layout buffer, where activation_slot_bytes is 0.
     scratch_base = tl.cast(num_activation_slots * activation_slot_bytes, tl.int64)
+    if FRAME:
+        # the elastic frame may use the free top of the last slot
+        scratch_base = tl.minimum(scratch_base, frame_floor)
     tl.device_assert(
         scratch_bottom >= scratch_base,
         "OOM: scratch overflow into activation slots",
@@ -1301,6 +1333,9 @@ def _triton_get_backward_plan(
     buffer_size: tl.constexpr,
     num_activation_slots: tl.constexpr,
     moe_layer_id_ptr,  # [N] int64 - IN-PLACE updated
+    frame_rows_ptr,  # optional [1] int64 output (EPArena elastic frame)
+    FRAME: tl.constexpr,
+    LEAN: tl.constexpr = True,
 ):
     """Triton kernel to compute backward plan without D2H transfers.
 
@@ -1357,6 +1392,47 @@ def _triton_get_backward_plan(
     grad_h2_size = _tl_align(num_recv_tokens * intermediate_dim_bytes)
     grad_h3_gathered_size = _tl_align(num_recv_tokens * hidden_dim_bytes)
     grad_h1_size = _tl_align(num_recv_tokens * double_intermediate_dim_bytes)
+    if FRAME:
+        # EPArena elastic frame: every scratch tensor below holds only the rows
+        # that fit between the top of the last slot (this layer's saved state
+        # included) and the scratch end; the caller runs rounds over them.
+        frame_floor = tl.load(buffer_offsets_ptr + (num_activation_slots - 1))
+        if need_recompute:
+            # this layer's saved x (top of its slot) is copied to the dispatch
+            # buffer before the first frame tensor is written: the frame may use it
+            frame_floor = tl.where(
+                microbatch_id == num_activation_slots - 1,
+                tl.minimum(frame_floor, fwd_x_offset),
+                frame_floor,
+            )
+        frame_row = 3 * double_intermediate_dim_bytes // 2
+        if hidden_dim_bytes > intermediate_dim_bytes:
+            frame_row += hidden_dim_bytes
+        frame_row = tl.where(
+            need_recompute, frame_row + hidden_dim_bytes + double_intermediate_dim_bytes, frame_row
+        )
+        frame_rows = _epa_frame_rows(scratch_end, frame_floor, frame_row, num_recv_tokens, 6)
+        # Lean layout (recompute only), used when the usual one would split the
+        # rows into rounds: after FC13, x_gathered is dropped (its rows wait at
+        # their home GPUs' dispatch buffers) and pulled again before W13 WGRAD,
+        # so it shares grad_h3_gathered's place and a row needs D fewer bytes.
+        lean_rows = _epa_frame_rows(
+            scratch_end, frame_floor, frame_row - hidden_dim_bytes, num_recv_tokens, 5
+        )
+        lean = (need_recompute != 0) & (frame_rows < num_recv_tokens) & (lean_rows > frame_rows)
+        if not LEAN:
+            lean = tl.zeros([], dtype=tl.int1)
+        frame_rows = tl.where(lean, lean_rows, frame_rows)
+        x_gathered_size = _tl_align(frame_rows * hidden_dim_bytes)
+        h1_size = _tl_align(frame_rows * double_intermediate_dim_bytes)
+        h2_size = _tl_align(frame_rows * intermediate_dim_bytes)
+        grad_h2_size = _tl_align(frame_rows * intermediate_dim_bytes)
+        grad_h3_gathered_size = _tl_align(frame_rows * hidden_dim_bytes)
+        grad_h1_size = _tl_align(frame_rows * double_intermediate_dim_bytes)
+        tl.store(frame_rows_ptr, frame_rows)
+        tl.store(frame_rows_ptr + 1, lean.to(tl.int64))
+    else:
+        lean = tl.zeros([], dtype=tl.int1)
 
     # LIVENESS-BASED MEMORY REUSE (applies to both recompute and no-recompute):
     #
@@ -1402,26 +1478,31 @@ def _triton_get_backward_plan(
         # gradient tensors.
         scratch_grad_bottom = tl.minimum(grad_h2_offset, grad_h3_gathered_offset)
         h1_offset = scratch_grad_bottom - h1_size
-        x_gathered_offset = h1_offset - x_gathered_size
-        scratch_bottom = x_gathered_offset
+        if lean:
+            # dead until dgrad_dispatch writes grad_h3_gathered; pulled back after W2 WGRAD
+            x_gathered_offset = grad_h3_gathered_offset
+            scratch_bottom = h1_offset
+        else:
+            x_gathered_offset = h1_offset - x_gathered_size
+            scratch_bottom = x_gathered_offset
     else:
         # No-recompute mode: x_gathered and h1 saved from forward
         x_gathered_offset = fwd_x_gathered_offset
         h1_offset = fwd_h1_offset
         scratch_bottom = tl.minimum(grad_h2_offset, grad_h3_gathered_offset)
 
+    scratch_base = tl.cast(num_activation_slots * activation_slot_bytes, tl.int64)
+    if FRAME:
+        scratch_base = tl.minimum(scratch_base, frame_floor)
     # Assert scratch allocations don't overflow into activation slots
     tl.device_assert(
-        scratch_bottom
-        >= tl.cast(num_activation_slots * activation_slot_bytes, tl.int64),
+        scratch_bottom >= scratch_base,
         "OOM: scratch overflow into activation slots",
     )
 
     # Per-slot peak free-space tracking: same logic as the forward kernel.
     slot_free = slot_end - free_start
-    scratch_free = scratch_bottom - tl.cast(
-        num_activation_slots * activation_slot_bytes, tl.int64
-    )
+    scratch_free = scratch_bottom - scratch_base
 
     # Update peak for this microbatch's activation slot
     current_slot_peak = tl.load(peak_min_free_space_ptr + microbatch_id)
